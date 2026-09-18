@@ -83,3 +83,6 @@ npm-debug.log*
 
 # 注意：以下锁文件必须提交，不要忽略
 #   go.sum / requirements.txt / package-lock.json
+
+# --- 本地验收实例（scripts/dev_local_up.sh 的产物）---
+.dev-local/

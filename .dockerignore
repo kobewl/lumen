@@ -1,0 +1,46 @@
+# Docker 构建上下文排除清单
+#
+# 镜像里只会 COPY server/，因此这里的排除主要不是"防打包"，
+# 而是**别把本地数据发给 Docker daemon**：
+#   - .dev-local/ 含本地库与模型请求日志（有 prompt 原文）；
+#   - ~/.lumen 之类不进仓库，但 desktop/ 下可能有 .venv 与缓存。
+# 顺带大幅减小构建上下文，加快每次构建。
+
+# 本地数据与运行时产物
+.dev-local/
+data/
+backups/
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# 密钥（绝不允许进入构建上下文）
+.env
+.env.*
+lumen.env
+lumen.env.local
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+device_secret*
+device_token*
+
+# 采集端（服务端构建不需要，且含虚拟环境）
+desktop/
+
+# 其它
+.git/
+.gitignore
+docs/
+protocol/
+scripts/
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.log

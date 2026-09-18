@@ -28,6 +28,8 @@ help:
 	@echo "  make build-server     编译服务端二进制"
 	@echo "  make run-server       本地启动服务端（读取环境变量）"
 	@echo "  make e2e              端到端联调（假事件 → Session → mock DeepSeek）"
+	@echo "  make local-up         起本地可验收实例（独立数据路径 + 假模型，无需真实密钥）"
+	@echo "  make local-down       停止本地可验收实例"
 	@echo "  make clean            清理构建产物与临时数据"
 
 # ---- 环境准备 ----
@@ -134,6 +136,20 @@ desktop-run:
 .PHONY: e2e
 e2e:
 	@bash scripts/e2e_local.sh
+
+# ---- 本地可验收实例 ----
+#
+# 与 e2e 的区别：e2e 是"跑一遍就退出"的自动化验证，这个是**留下来可以手工提问**
+# 的完整实例——独立端口、独立数据目录（.dev-local/）、本地假模型顶替 DeepSeek。
+# 不需要任何真实密钥，不碰生产数据。验收步骤见 docs/manual_acceptance.md。
+
+.PHONY: local-up
+local-up:
+	@bash scripts/dev_local_up.sh
+
+.PHONY: local-down
+local-down:
+	@bash scripts/dev_local_up.sh down
 
 # ---- 清理 ----
 
