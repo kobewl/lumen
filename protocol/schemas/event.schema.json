@@ -19,11 +19,11 @@
     },
     "type": {
       "type": "string",
-      "enum": ["window.activity", "idle.state", "git.activity"]
+      "enum": ["window.activity", "idle.state", "git.activity", "agent.task_summary"]
     },
     "timestamp": {
       "type": "string",
-      "description": "事件开始时间（idle.state 为状态区间的开始时间），UTC RFC3339",
+      "description": "事件发生时间，UTC RFC3339。idle.state 时为状态区间开始时间；agent.task_summary 时为该任务的 occurred_at（结束/汇报时刻）。每个事件只有一个权威时间点，因此不再在 data 里重复 occurred_at。",
       "format": "date-time",
       "pattern": "Z$"
     },
@@ -52,13 +52,60 @@
         "schema_version": {
           "type": "integer",
           "minimum": 1,
-          "description": "idle.state 的区间语义版本。2 表示 timestamp 是区间开始、duration_seconds 是区间长度；缺省视为旧语义（timestamp 是区间结束）。"
+          "description": "版本号，含义按事件类型解释：idle.state 的 2 表示 timestamp 是区间开始、duration_seconds 是区间长度（缺省视为旧语义）；agent.task_summary 的 1 表示首版任务摘要字段集。"
         },
         "branch": { "type": "string", "maxLength": 128 },
         "head_commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
         "commit_message": { "type": "string", "maxLength": 200 },
         "changed_files_count": { "type": "integer", "minimum": 0, "maximum": 100000 },
-        "kind": { "type": "string", "enum": ["commit", "workspace"] }
+        "kind": { "type": "string", "enum": ["commit", "workspace"] },
+
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$",
+          "description": "任务在来源 Agent 内的稳定 ID。服务端按 (device_id, task_id) 幂等 upsert，同一任务重复汇报只保留最新一条。"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "任务标题（一行）。注意：这是任务摘要的正式字段，不是窗口标题；窗口标题在任何事件类型下都不允许上传。"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["done", "partial", "blocked", "abandoned", "unknown"],
+          "description": "任务结束状态。unknown 表示 Agent 自己也没给出结论，不要猜。"
+        },
+        "outcomes": {
+          "type": "array",
+          "maxItems": 8,
+          "description": "Agent 报告的已产出结果（元数据级短句，如“新增 X 能力”）。禁止放代码、diff、命令输出或对话原文。",
+          "items": { "type": "string", "minLength": 1, "maxLength": 120 }
+        },
+        "open_loops": {
+          "type": "array",
+          "maxItems": 8,
+          "description": "Agent 报告的未完成事项 / 下一步。同样只允许元数据级短句。",
+          "items": { "type": "string", "minLength": 1, "maxLength": 120 }
+        },
+        "source_agent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "提交这份摘要的集成标识（如 zcode-cli）。用于区分不同来源，不用于身份认证。"
+        },
+        "source_session_id": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "来源 Agent 自己的会话/任务 ID，仅用于来源追溯与去重，绝不进入用户可见文本或模型上下文。"
+        },
+        "privacy_mode": {
+          "type": "string",
+          "const": "metadata_only",
+          "description": "隐私模式。V0.1 只接受 metadata_only：只允许元数据级摘要，服务端会拒绝包含路径、URL、凭证或超长正文的内容。"
+        }
       }
     }
   },
@@ -89,6 +136,21 @@
           "privacy": { "const": "P1" },
           "context": { "required": ["repo"] },
           "data": { "required": ["kind"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "agent.task_summary" } } },
+      "then": {
+        "properties": {
+          "privacy": { "const": "P1" },
+          "context": { "required": ["app"] },
+          "data": {
+            "required": ["task_id", "title", "status", "source_agent", "privacy_mode"],
+            "properties": {
+              "schema_version": { "const": 1 }
+            }
+          }
         }
       }
     }

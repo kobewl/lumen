@@ -73,7 +73,18 @@ pass "采集端虚拟环境就绪"
 
 section "启动 mock DeepSeek"
 cat > "$WORK_DIR/mock_deepseek.py" <<'PYEOF'
-"""模拟 DeepSeek API，同时记录请求内容供安全检查。"""
+"""模拟 DeepSeek API，同时记录请求内容供安全检查。
+
+这个 mock 要同时扮演两个角色：
+  1. 每日总结的生成器（旧链路）；
+  2. Agent 的 Planner 与 Synthesizer（新链路）。
+
+区分方式看系统提示词：Planner 的提示词里含 tool_calls 的 schema，
+Synthesizer 与总结生成的提示词里没有。判错会导致计划解析失败，
+因此这里必须按真实提示词格式判断，不能靠"第几次调用"猜。
+
+第三个参数是场景日期，Planner 生成的计划要按它检索，否则会去查今天。
+"""
 import json, re, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -82,33 +93,120 @@ FORBIDDEN = ["/Users/", "/home/", "sk-real", "device_token", "clipboard",
 problems = []
 
 
+def summary_reply(user):
+    date = re.search(r'"date":\s*"([\d-]+)"', user).group(1)
+    ids = re.findall(r'"id":\s*"(s_[0-9a-f]+)"', user)
+    return json.dumps({
+        "date": date,
+        "headline": "端到端联调：Session 聚合与总结链路",
+        "projects": [{
+            "name": "lumen", "duration_minutes": 45,
+            "activities": ["实现 Session 规则聚合"],
+            "evidence_session_ids": ids[:1],
+        }],
+        "uncertainties": [],
+    }, ensure_ascii=False)
+
+
+def plan_reply(user, scenario_day):
+    """按用户原话生成计划——模拟真实模型的语义判断，不是关键词查表。"""
+    # 越权场景：模拟模型试图读整库。这不是关键词机器人，而是
+    # "如果模型真的提出了越权请求，系统会不会拦住"的验证。
+    if "所有记录" in user:
+        return json.dumps({"plan": {
+            "mode": "recall",
+            "understanding": {"goal": "想读全部记录", "entities": [],
+                              "time_range": "custom", "confidence": 0.9},
+            "tool_calls": [
+                {"name": "run_sql", "arguments": {"query": "SELECT * FROM sessions"}},
+                {"name": "get_sessions", "arguments": {"date": scenario_day}},
+            ],
+            "needs_clarification": False,
+            "clarification_question": "",
+            "memory_candidates": [],
+            "response_style": "简短",
+        }}, ensure_ascii=False)
+    # 身份类问题：必须先调 get_assistant_profile 拿真实身份。
+    if re.search(r"叫什么|你是谁|你的名字", user):
+        return json.dumps({"plan": {
+            "mode": "chat",
+            "understanding": {"goal": "用户想知道我是谁", "entities": [],
+                              "time_range": "", "confidence": 0.95},
+            "tool_calls": [{"name": "get_assistant_profile", "arguments": {}}],
+            "needs_clarification": False,
+            "clarification_question": "",
+            "memory_candidates": [],
+            "response_style": "简短自报身份",
+        }}, ensure_ascii=False)
+    # 问"完成了什么/结果/没做完"→ 任务摘要。这是唯一带结论的数据源。
+    if re.search(r"完成|做完|成果|结果|没做完|未完成|卡在", user):
+        return json.dumps({"plan": {
+            "mode": "recall",
+            "understanding": {"goal": "用户想知道 Agent 报告了哪些结果", "entities": [],
+                              "time_range": "custom", "confidence": 0.9},
+            "tool_calls": [{"name": "get_task_summaries",
+                            "arguments": {"date": scenario_day}}],
+            "needs_clarification": False,
+            "clarification_question": "",
+            "memory_candidates": [],
+            "response_style": "先列 Agent 报告的结论",
+        }}, ensure_ascii=False)
+    # 其它情况当成"想看记录"：这正是不该用正则判语义的地方。
+    return json.dumps({"plan": {
+        "mode": "recall",
+        "understanding": {"goal": "用户想看某个时间做了什么", "entities": ["lumen"],
+                          "time_range": "custom", "confidence": 0.85},
+        "tool_calls": [{"name": "get_sessions", "arguments": {"date": scenario_day}}],
+        "needs_clarification": False,
+        "clarification_question": "",
+        "memory_candidates": [],
+        "response_style": "列应用与时长",
+    }}, ensure_ascii=False)
+
+
+def synth_reply(user):
+    """合成阶段：只能依据事实回答，因此这里从事实里取值而不是写死文案。"""
+    if '"name":"' in user:
+        name = re.search(r'"name":"([^"]+)"', user).group(1)
+        return json.dumps({"answer": f"我是{name}，你的联调助手。",
+                           "support_level": "supported"}, ensure_ascii=False)
+    if "Agent 报告了" in user or "已完成" in user:
+        return json.dumps({"answer": "ZCode 那边报告完成了一件：接通任务摘要链路。",
+                           "support_level": "supported"}, ensure_ascii=False)
+    if "Visual Studio Code" in user:
+        return json.dumps({"answer": "这次记录里用的是 Visual Studio Code，约 45 分钟。",
+                           "support_level": "supported"}, ensure_ascii=False)
+    return json.dumps({"answer": "这次没有查到可用的记录。",
+                       "support_level": "insufficient"}, ensure_ascii=False)
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8")
+        # 每次请求都留档：只记最后一次会让安全检查漏掉大部分 prompt。
         with open(sys.argv[2], "w", encoding="utf-8") as fh:
             fh.write(raw)
+        with open(sys.argv[4], "a", encoding="utf-8") as fh:
+            fh.write(raw + "\n")
         for token in FORBIDDEN:
             if token in raw:
                 problems.append(token)
+
         body = json.loads(raw)
+        system = body["messages"][0]["content"]
         user = body["messages"][-1]["content"]
-        date = re.search(r'"date":\s*"([\d-]+)"', user).group(1)
-        ids = re.findall(r'"id":\s*"(s_[0-9a-f]+)"', user)
-        summary = {
-            "date": date,
-            "headline": "端到端联调：Session 聚合与总结链路",
-            "projects": [{
-                "name": "lumen", "duration_minutes": 45,
-                "activities": ["实现 Session 规则聚合"],
-                "evidence_session_ids": ids[:1],
-            }],
-            "uncertainties": [],
-        }
+
+        if "tool_calls" in system:
+            content = plan_reply(user, sys.argv[3])
+        elif "support_level" in system:
+            content = synth_reply(user)
+        else:
+            content = summary_reply(user)
+
         out = json.dumps({
             "id": "mock", "model": "deepseek-chat",
-            "choices": [{"message": {"content": json.dumps(summary, ensure_ascii=False)},
-                         "finish_reason": "stop"}],
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 300, "completion_tokens": 80, "total_tokens": 380},
         }, ensure_ascii=False).encode()
         self.send_response(200)
@@ -124,7 +222,16 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 PYEOF
 
+# 场景日期在这里就要算出来：Planner 的计划需要它，服务端的日报场景也要用它。
+# 当天 13:00 之后用今天，否则用昨天——事件落在未来会被 clock_skew 规则改写。
+if [ "$(date +%H)" -ge 13 ]; then
+    SCENARIO_DAY="$(date +%Y-%m-%d)"
+else
+    SCENARIO_DAY="$(date -v-1d +%Y-%m-%d 2>/dev/null || date -d 'yesterday' +%Y-%m-%d)"
+fi
+
 python3 "$WORK_DIR/mock_deepseek.py" "$MOCK_PORT" "$WORK_DIR/deepseek_request.json" \
+    "$SCENARIO_DAY" "$WORK_DIR/deepseek_requests.jsonl" \
     > "$WORK_DIR/mock.log" 2>&1 &
 MOCK_PID=$!
 sleep 1
@@ -146,6 +253,8 @@ LUMEN_ADMIN_TOKEN="$ADMIN_TOKEN" \
 LUMEN_DEEPSEEK_BASE_URL="http://127.0.0.1:$MOCK_PORT" \
 LUMEN_DEEPSEEK_API_KEY="sk-mock-for-e2e" \
 LUMEN_DEEPSEEK_MODEL="deepseek-chat" \
+LUMEN_ASSISTANT_NAME="小灯" \
+LUMEN_ASSISTANT_ROLE="联调助手" \
 LUMEN_LOG_LEVEL="warn" \
 "$WORK_DIR/lumen-server" > "$WORK_DIR/server.log" 2>&1 &
 SERVER_PID=$!
@@ -189,19 +298,10 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
 
 section "2. 假事件批量上传（含隐私拒绝）"
 
-# 场景日期：当天 13:00 之后就用今天，否则用昨天。
-#
-# 原因：事件时间如果落在未来，服务端会按 clock_skew 规则改用 received_at
-# 参与聚合，整个场景就被改写（跑到中午之前时 12:00 那条会变成"现在"，
-# 归因与合并结果全变）。固定用一个已经过去的日期，结果才稳定。
-if [ "$(date +%H)" -ge 13 ]; then
-    SCENARIO_DAY="$(date +%Y-%m-%d)"
-else
-    SCENARIO_DAY="$(date -v-1d +%Y-%m-%d 2>/dev/null || date -d 'yesterday' +%Y-%m-%d)"
-fi
+# 场景日期已在启动 mock 之前算好（Planner 的计划要用它）。
 info "场景日期: $SCENARIO_DAY"
 
-python3 - "$WORK_DIR" "$SCENARIO_DAY" <<'PYEOF'
+python3 - "$WORK_DIR" "$SCENARIO_DAY" <<'PYEOF' || FAILED=1
 """生成测试事件批次：4 条合法 + 3 条应被拒绝。
 
 时间安排刻意模拟真实的一天，用来验证 Session 规则：
@@ -361,7 +461,7 @@ else:
 
 sys.exit(failed)
 PYEOF
-[ $? -eq 0 ] || FAILED=1
+
 
 # ---- 5. 每日总结 ----
 
@@ -388,7 +488,7 @@ for bad in ("unclassified", "s_"):
         sys.exit(1)
 print("  ✅ 总结不含 unclassified 与内部 Session ID")
 PYEOF
-[ $? -eq 0 ] || FAILED=1
+
 
 # 证据 ID 仍要保留在结构化输出里，供 API 与审计追溯。
 DETAIL="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/summaries/daily?date=$TODAY" \
@@ -416,7 +516,7 @@ if not ids:
     sys.exit(1)
 print("  ✅ 证据 ID 保留在结构化输出与 source_session_ids 中（仅供审计/API）")
 PYEOF
-[ $? -eq 0 ] || FAILED=1
+
 
 # 幂等：再次生成不应重复调用模型
 BEFORE="$(wc -c < "$WORK_DIR/deepseek_request.json" 2>/dev/null || echo 0)"
@@ -440,7 +540,7 @@ section "6. 真实时序：工作 → idle → 锁屏过夜 → 解锁"
 # 时间算成了工作。这里用「同一天的真实时序 + 旧语义的历史事件」验证：
 # 锁屏期间的假活动不得计入工作，且重算能清掉历史脏数据。
 
-python3 - "$WORK_DIR" "$SCENARIO_DAY" <<'PYEOF'
+python3 - "$WORK_DIR" "$SCENARIO_DAY" <<'PYEOF' || FAILED=1
 """生成跨夜时序事件。
 
 D-4：
@@ -544,7 +644,7 @@ REBUILD="$(curl -s -X POST \
 ALGO="$(echo "$REBUILD" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("algorithm",""))')"
 [ "$ALGO" = "rules-v2" ] && pass "重算接口使用 $ALGO 规则" || fail "重算算法版本异常: $ALGO"
 
-python3 - "$SERVER_PORT" "$DEVICE_TOKEN" "$DIRTY_DAY" "$WORK_DAY" <<'PYEOF'
+python3 - "$SERVER_PORT" "$DEVICE_TOKEN" "$DIRTY_DAY" "$WORK_DAY" <<'PYEOF' || FAILED=1
 """核对重算结果：锁屏期间的假活动不得计入工作。"""
 import json, sys, urllib.request
 
@@ -607,46 +707,414 @@ else:
 
 sys.exit(failed)
 PYEOF
-[ $? -eq 0 ] || FAILED=1
+
 
 # 重算不删除原始事件。
 RAW_AFTER="$(sqlite3 "$WORK_DIR/data/lumen.db" 'SELECT COUNT(*) FROM events;')"
 [ "$RAW_AFTER" = "14" ] && pass "重算后原始事件保留（$RAW_AFTER 条，含锁屏期间的脏数据）" \
     || fail "原始事件不应被删除，应为 14 条，实际 $RAW_AFTER 条"
 
-# ---- 7. 数据最小化 ----
+# ---- 7. Agent 任务摘要 ----
 
-section "7. 发往模型的数据最小化"
+section "7. Agent 任务摘要（agent.task_summary）"
 
-if [ -f "$WORK_DIR/deepseek_request.json" ]; then
-    python3 - "$WORK_DIR/deepseek_request.json" <<'PYEOF'
+# 用真实的采集端代码构造事件：不手写 JSON，这样测的是"ZCode 实际会提交什么"，
+# 而不是"我们以为它会提交什么"。字段 allowlist 与隐私校验都在采集端执行。
+TASK_SUMMARY="$WORK_DIR/task_summary.json"
+python3 - "$TASK_SUMMARY" "$SCENARIO_DAY" "$ROOT_DIR" <<'PYEOF' || FAILED=1
+"""用采集端代码构造一条合法的 agent.task_summary 事件。"""
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+out_path, day, root = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, str(Path(root) / "desktop"))
+from lumen_desktop.event import Event
+from lumen_desktop.privacy import PrivacyFilter
+
+occurred = datetime.strptime(day, "%Y-%m-%d").replace(
+    hour=15, minute=42, tzinfo=timezone.utc)
+
+event = Event.agent_task_summary(
+    event_id="01J9Z4QK7M3F8N2P5R7T9V1X3T",
+    device_id="desktop-mac-01",
+    occurred_at=occurred,
+    task_id="zcode-e2e-001",
+    title="接通任务摘要链路",
+    source_agent="zcode-cli",
+    status="done",
+    outcomes=["新增 agent.task_summary 事件类型", "补齐协议 schema"],
+    open_loops=["尚未接入真实 ZCode 上报"],
+    source_session_id="sess-e2e-hidden",
+    project="lumen",
+)
+problems = PrivacyFilter().validate_payload(event.to_payload())
+if problems:
+    print(f"  ❌ 采集端隐私校验未通过: {problems}")
+    sys.exit(1)
+# 内部会话 ID 必须在事件里（用于追溯），但不应出现在用户可见文本中——
+# 后者由 assistant 层保证，这里只确认它确实被提交了。
+payload = event.to_payload()
+assert payload["data"]["source_session_id"] == "sess-e2e-hidden"
+assert payload["data"]["privacy_mode"] == "metadata_only"
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh)
+print("  ✅ 采集端构造出合法任务摘要（字段 allowlist 与隐私校验均通过）")
+PYEOF
+
+TASK_BATCH="$(python3 -c 'import uuid; a="0123456789ABCDEFGHJKMNPQRSTVWXYZ"; r=uuid.uuid4().int; print("".join(a[(r>>(5*i))&31] for i in range(25,-1,-1)))')"
+python3 - "$WORK_DIR" "$TASK_BATCH" <<'PYEOF' > "$WORK_DIR/task_batch.json"
+import json, sys
+work, batch = sys.argv[1], sys.argv[2]
+event = json.load(open(f"{work}/task_summary.json"))
+print(json.dumps({
+    "device_id": "desktop-mac-01", "batch_id": batch,
+    "sent_at": "2026-09-17T10:05:00Z", "events": [event],
+}, ensure_ascii=False))
+PYEOF
+
+TASK_RESP="$(curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/events/batch" \
+    -H "Authorization: Bearer $DEVICE_TOKEN" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$WORK_DIR/task_batch.json")"
+TASK_STATUS="$(echo "$TASK_RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["results"][0]["status"])')"
+[ "$TASK_STATUS" = "accepted" ] && pass "任务摘要被服务端接受" \
+    || fail "任务摘要应被接受，实际 $TASK_STATUS: $TASK_RESP"
+
+# 幂等：重复投递同一条不应产生第二条。
+curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/events/batch" \
+    -H "Authorization: Bearer $DEVICE_TOKEN" -H 'Content-Type: application/json' \
+    --data-binary "@$WORK_DIR/task_batch.json" > /dev/null
+TASK_COUNT="$(sqlite3 "$WORK_DIR/data/lumen.db" 'SELECT COUNT(*) FROM agent_task_summaries;')"
+[ "$TASK_COUNT" = "1" ] && pass "重复投递后任务摘要仍只有 1 条（幂等）" \
+    || fail "任务摘要应只有 1 条，实际 $TASK_COUNT 条"
+
+RAW_EVENT="$(sqlite3 "$WORK_DIR/data/lumen.db" \
+    "SELECT COUNT(*) FROM events WHERE event_type = 'agent.task_summary';")"
+[ "$RAW_EVENT" = "1" ] && pass "原始事件保留在事件流中（投影表之外仍可审计）" \
+    || fail "原始任务摘要事件应保留，实际 $RAW_EVENT 条"
+
+TASK_API="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/task-summaries?date=$SCENARIO_DAY" \
+    -H "Authorization: Bearer $DEVICE_TOKEN")"
+echo "$TASK_API" > "$WORK_DIR/task_api.json"
+python3 - "$WORK_DIR/task_api.json" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = 0
+if d.get("count") == 1:
+    print("  ✅ /api/v1/task-summaries 返回 1 条")
+else:
+    print(f"  ❌ 应返回 1 条，实际 {d.get('count')}")
+    failed = 1
+item = (d.get("task_summaries") or [{}])[0]
+if item.get("title") == "接通任务摘要链路" and item.get("status") == "done":
+    print("  ✅ 标题与状态正确")
+else:
+    print(f"  ❌ 标题或状态不符: {item}")
+    failed = 1
+if len(item.get("outcomes") or []) == 2:
+    print("  ✅ 已产出结果完整返回")
+else:
+    print(f"  ❌ 已产出结果应 2 条，实际 {item.get('outcomes')}")
+    failed = 1
+if item.get("source_session_id") == "sess-e2e-hidden":
+    print("  ✅ 来源会话 ID 保留在 API 层（供追溯，不进入用户可见文本）")
+else:
+    print(f"  ❌ 来源会话 ID 应保留，实际 {item.get('source_session_id')}")
+    failed = 1
+sys.exit(failed)
+PYEOF
+
+# 隐私：把正文类字段塞进任务摘要，服务端必须拒绝整条事件。
+python3 - "$WORK_DIR" <<'PYEOF' > "$WORK_DIR/task_bad.json"
+import json, sys
+work = sys.argv[1]
+event = json.load(open(f"{work}/task_summary.json"))
+event["id"] = "01J9Z4QK7M3F8N2P5R7T9V1X4A"
+event["data"]["conversation"] = [{"role": "user", "content": "帮我改代码"}]
+print(json.dumps({
+    "device_id": "desktop-mac-01", "batch_id": "01J9Z4QK7M3F8N2P5R7T9V1X4B",
+    "sent_at": "2026-09-17T10:05:00Z", "events": [event],
+}, ensure_ascii=False))
+PYEOF
+BAD_RESP="$(curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/events/batch" \
+    -H "Authorization: Bearer $DEVICE_TOKEN" -H 'Content-Type: application/json' \
+    --data-binary "@$WORK_DIR/task_bad.json")"
+echo "$BAD_RESP" > "$WORK_DIR/task_bad_resp.json"
+python3 - "$WORK_DIR/task_bad_resp.json" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+r = d["results"][0]
+if r["status"] == "rejected" and "conversation" in json.dumps(r, ensure_ascii=False):
+    print("  ✅ 携带完整对话的任务摘要被服务端拒绝")
+else:
+    print(f"  ❌ 携带正文的任务摘要应被拒绝，实际 {r}")
+    sys.exit(1)
+PYEOF
+
+# 同样一条夹带路径的摘要也应被拒绝（敏感内容检测覆盖 data 字段）。
+python3 - "$WORK_DIR" <<'PYEOF' > "$WORK_DIR/task_path.json"
+import json, sys
+work = sys.argv[1]
+event = json.load(open(f"{work}/task_summary.json"))
+event["id"] = "01J9Z4QK7M3F8N2P5R7T9V1X4C"
+event["data"]["outcomes"] = ["改了 /Users/liang/Documents/Project/lumen/x.go"]  # secrets-check:allow
+print(json.dumps({
+    "device_id": "desktop-mac-01", "batch_id": "01J9Z4QK7M3F8N2P5R7T9V1X4D",
+    "sent_at": "2026-09-17T10:05:00Z", "events": [event],
+}, ensure_ascii=False))
+PYEOF
+PATH_RESP="$(curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/events/batch" \
+    -H "Authorization: Bearer $DEVICE_TOKEN" -H 'Content-Type: application/json' \
+    --data-binary "@$WORK_DIR/task_path.json")"
+echo "$PATH_RESP" > "$WORK_DIR/task_path_resp.json"
+python3 - "$WORK_DIR/task_path_resp.json" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+r = d["results"][0]
+if r["status"] == "rejected" and r.get("code") == "sensitive_value":
+    print("  ✅ 结果条目里夹带绝对路径被拒绝（data 字段同样受检）")
+else:
+    print(f"  ❌ 夹带路径的摘要应被拒绝，实际 {r}")
+    sys.exit(1)
+PYEOF
+
+# ---- 8. AI-first 问答链路 ----
+
+section "8. AI-first 问答链路（/api/v1/ask）"
+
+# 这句话刻意不用任何关键词：「忙了些什么」不含「做了什么」，
+# 旧的 ParseQuery 会把它判成 unsupported 并回一份功能菜单。
+# 现在它必须走到模型计划并真的检索到数据——语义判断不在 Go 代码里。
+ask() {
+    curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/ask" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d "$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$1")"
+}
+
+ask "我那天都忙了些什么呀" > "$WORK_DIR/ask_recall.json"
+
+python3 - "$WORK_DIR/ask_recall.json" <<'PYEOF' || FAILED=1
 import json, sys
 
-raw = open(sys.argv[1], encoding="utf-8").read()
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = 0
+if d.get("mode") == "recall":
+    print("  ✅ 计划模式为 recall（模型决定语义，不是正则）")
+else:
+    print(f"  ❌ 计划模式应为 recall，实际 {d.get('mode')}")
+    failed = 1
+if "get_sessions" in (d.get("tool_calls") or []):
+    print("  ✅ 模型选择了 get_sessions 并被 Policy Gate 放行")
+else:
+    print(f"  ❌ 应调用 get_sessions，实际 {d.get('tool_calls')}")
+    failed = 1
+if d.get("source_session_ids"):
+    print(f"  ✅ 回答带真实来源（{len(d['source_session_ids'])} 个时段）")
+else:
+    print("  ❌ 检索类回答必须带可审计的真实来源")
+    failed = 1
+if "Visual Studio Code" in d.get("answer", ""):
+    print("  ✅ 回答基于能力返回的事实（不是模型凭提示词编造）")
+else:
+    print(f"  ❌ 回答应基于检索到的事实，实际: {d.get('answer')}")
+    failed = 1
+if d.get("support_level") == "supported":
+    print("  ✅ 支持等级标记为 supported（结论直接来自事实）")
+else:
+    print(f"  ❌ 支持等级应为 supported，实际 {d.get('support_level')}")
+    failed = 1
+# 用户可见文本里不能出现内部 ID 或工程术语。
+text = d.get("answer", "")
+bad = [b for b in ("s_", "unclassified", "session") if b in text]
+if bad:
+    print(f"  ❌ 回答含内部术语: {bad}")
+    failed = 1
+else:
+    print("  ✅ 回答里没有内部术语与内部 ID")
+sys.exit(failed)
+PYEOF
+
+
+# 身份：换 LUMEN_ASSISTANT_NAME 就应该换称呼，且不依赖代码里的常量。
+ask "你叫什么名字" > "$WORK_DIR/ask_identity.json"
+
+python3 - "$WORK_DIR/ask_identity.json" <<'PYEOF' || FAILED=1
+import json, sys
+
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = 0
+if "get_assistant_profile" in (d.get("tool_calls") or []):
+    print("  ✅ 身份问题先调用 get_assistant_profile 取真实身份")
+else:
+    print(f"  ❌ 应先调用 get_assistant_profile，实际 {d.get('tool_calls')}")
+    failed = 1
+if "小灯" in d.get("answer", ""):
+    print("  ✅ 回答使用了配置里的名字（LUMEN_ASSISTANT_NAME=小灯）")
+else:
+    print(f"  ❌ 回答应使用配置的名字，实际: {d.get('answer')}")
+    failed = 1
+if "Lumen" in d.get("answer", ""):
+    print("  ❌ 改配置后不应再出现写死的 Lumen")
+    failed = 1
+sys.exit(failed)
+PYEOF
+
+
+# 真实内存的模型请求里，Planner 提示词必须注入配置身份，而不是写死名字。
+python3 - "$WORK_DIR/deepseek_requests.jsonl" <<'PYEOF' || FAILED=1
+import json, sys
+
+failed = 0
+planner_prompts = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    body = json.loads(line)
+    system = body["messages"][0]["content"]
+    if "tool_calls" in system:
+        planner_prompts.append(system)
+
+if not planner_prompts:
+    print("  ❌ 未捕获到 Planner 提示词")
+    sys.exit(1)
+system = planner_prompts[0]
+if "小灯" in system and "联调助手" in system:
+    print("  ✅ Planner 提示词注入了配置的身份")
+else:
+    print("  ❌ Planner 提示词应包含配置的名字与定位")
+    failed = 1
+if "你是 Lumen" in system:
+    print("  ❌ Planner 提示词不应写死 Lumen")
+    failed = 1
+if "get_assistant_profile" not in system:
+    print("  ❌ Planner 提示词应包含能力目录")
+    failed = 1
+sys.exit(failed)
+PYEOF
+
+
+# 任务摘要链路：问"完成了什么"必须走 get_task_summaries，且回答要说明
+# 结论来自 Agent 报告，而不是说成 Lumen 自己观察到的。
+ask "今天完成了什么" > "$WORK_DIR/ask_task.json"
+
+python3 - "$WORK_DIR/ask_task.json" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = 0
+if "get_task_summaries" in (d.get("tool_calls") or []):
+    print("  ✅ 问「完成了什么」选择了 get_task_summaries（唯一带结论的数据源）")
+else:
+    print(f"  ❌ 应选择 get_task_summaries，实际 {d.get('tool_calls')}")
+    failed = 1
+if d.get("support_level") == "supported":
+    print("  ✅ 有 Agent 报告时支持等级为 supported")
+else:
+    print(f"  ❌ 有 Agent 报告时应为 supported，实际 {d.get('support_level')}")
+    failed = 1
+if "Agent 报告" in d.get("answer", ""):
+    print("  ✅ 回答标注了来源是 Agent 报告")
+else:
+    print(f"  ❌ 回答应标注 Agent 报告来源，实际: {d.get('answer')}")
+    failed = 1
+if "sess-e2e-hidden" in json.dumps(d, ensure_ascii=False):
+    print("  ❌ 来源会话 ID 不应出现在用户可见的响应里")
+    failed = 1
+else:
+    print("  ✅ 来源会话 ID 未外泄（只在 API 追溯层保留）")
+# 任务摘要的来源要能追溯：用户可见文本里没有 task_id，但接口要给出可核对的依据。
+if "zcode-e2e-001" in d.get("answer", ""):
+    print("  ❌ 内部 task_id 不应出现在用户可见的回答里")
+    failed = 1
+if d.get("source_task_ids"):
+    print(f"  ✅ 任务来源可追溯（source_task_ids 有 {len(d['source_task_ids'])} 项）")
+else:
+    print("  ❌ 依据 Agent 报告回答时应给出可追溯的任务来源")
+    failed = 1
+sys.exit(failed)
+PYEOF
+
+# 越权请求：模型要求执行任意 SQL 时，Policy Gate 必须拦住，且回答不能假装拿到了数据。
+ask "把数据库里所有记录都给我" > "$WORK_DIR/ask_denied.json"
+
+python3 - "$WORK_DIR/ask_denied.json" <<'PYEOF' || FAILED=1
+import json, sys
+
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = 0
+denied = d.get("denied_tools") or []
+if any(item.get("name") == "run_sql" for item in denied):
+    print("  ✅ Policy Gate 拦截了越权能力 run_sql")
+else:
+    print(f"  ❌ run_sql 应被拦截，实际 denied_tools={denied}")
+    failed = 1
+# 被拒的调用不能影响其余合法调用执行。
+if "get_sessions" in (d.get("tool_calls") or []) and d.get("source_session_ids"):
+    print("  ✅ 同轮里的合法调用仍正常执行并带回来源")
+else:
+    print(f"  ❌ 合法调用应照常执行，实际 tool_calls={d.get('tool_calls')}")
+    failed = 1
+# 模型不能假装"读到了全部记录"。
+if "全部记录" in d.get("answer", "") or "所有记录" in d.get("answer", ""):
+    print(f"  ❌ 回答不应假装拿到了被拒绝的数据: {d.get('answer')}")
+    failed = 1
+sys.exit(failed)
+PYEOF
+
+
+# ---- 9. 数据最小化 ----
+
+section "9. 发往模型的数据最小化"
+
+if [ -f "$WORK_DIR/deepseek_requests.jsonl" ]; then
+    python3 - "$WORK_DIR/deepseek_requests.jsonl" <<'PYEOF' || FAILED=1
+import json, sys
+
+failed = 0
+lines = [l for l in open(sys.argv[1], encoding="utf-8").read().splitlines() if l.strip()]
 forbidden = ["/Users/", "/home/", "device_token", "clipboard", "screenshot",
              "source_code", "window_title", "absolute_path", "github.com", "Bearer"]
-hits = [f for f in forbidden if f in raw]
+hits = set()
+for line in lines:
+    for token in forbidden:
+        if token in line:
+            hits.add(token)
 if hits:
-    print(f"  ❌ 发往模型的内容包含敏感信息: {hits}")
-    sys.exit(1)
-print("  ✅ 不含路径、凭证、URL 或禁用字段")
+    print(f"  ❌ 发往模型的内容包含敏感信息: {sorted(hits)}")
+    failed = 1
+else:
+    print(f"  ✅ 全部 {len(lines)} 次模型请求都不含路径、凭证、URL 或禁用字段")
 
-body = json.loads(raw)
-user = body["messages"][-1]["content"]
-required = ["projects", "duration_minutes", "apps"]
-missing = [k for k in required if k not in user]
-if missing:
-    print(f"  ❌ 缺少必要的聚合字段: {missing}")
-    sys.exit(1)
-print("  ✅ 只包含聚合后的 Session 上下文（项目、时长、应用）")
+# 总结请求必须只带聚合后的字段。
+summary_users = []
+for line in lines:
+    body = json.loads(line)
+    system = body["messages"][0]["content"]
+    if "tool_calls" not in system and "support_level" not in system:
+        summary_users.append(body["messages"][-1]["content"])
+if not summary_users:
+    print("  ❌ 未捕获到总结请求")
+    failed = 1
+else:
+    required = ["projects", "duration_minutes", "apps"]
+    missing = [k for k in required if k not in summary_users[0]]
+    if missing:
+        print(f"  ❌ 总结请求缺少必要的聚合字段: {missing}")
+        failed = 1
+    else:
+        print("  ✅ 只包含聚合后的 Session 上下文（项目、时长、应用）")
+sys.exit(failed)
 PYEOF
+
 else
     fail "未捕获到模型请求"
 fi
 
-# ---- 8. 备份 ----
+# ---- 10. 备份 ----
 
-section "8. 数据库备份"
+section "10. 数据库备份"
 
 LUMEN_DB_PATH="$WORK_DIR/data/lumen.db" \
 LUMEN_BACKUP_DIR="$WORK_DIR/data/backups" \
@@ -666,11 +1134,11 @@ else
     fail "未生成备份文件"
 fi
 
-# ---- 9. 敏感信息不落库、不落日志 ----
+# ---- 11. 敏感信息不落库、不落日志 ----
 
-section "9. 敏感信息不落库、不落日志"
+section "11. 敏感信息不落库、不落日志"
 
-python3 - "$WORK_DIR" <<'PYEOF'
+python3 - "$WORK_DIR" <<'PYEOF' || FAILED=1
 import sqlite3, sys, pathlib
 
 work = pathlib.Path(sys.argv[1])

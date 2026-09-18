@@ -14,7 +14,8 @@ sessions/       规则 Session 聚合（唯一允许切分会话的地方）
 ai/             DeepSeek 客户端、上下文组装、输出校验、文本渲染
 summary/        总结编排：幂等申请 → 调用 → 持久化 → 推送
 scheduler/      每日总结、事件清理、WAL checkpoint、数据库快照
-feishu/         长连接机器人、用户白名单、三类最小问答
+assistant/      Agent Runtime：Profile、AgentPlan、Policy Gate、能力注册表、合成与校验
+feishu/         飞书渠道：长连接、用户白名单、幂等、回复发送与审计落库
 notification/   通知渠道抽象（V0.1 只有飞书）
 storage/        SQLite 打开、迁移与各表读写
 ulid/           事件 ID 生成与解析
@@ -28,14 +29,44 @@ POST /api/v1/devices/register                      一次性 enrollment token
 POST /api/v1/events/batch                          Bearer device token，逐事件 ACK
 GET  /api/v1/sessions?date=YYYY-MM-DD              Bearer device token
 POST /api/v1/sessions/rebuild?date=...|from=&to=   Bearer admin token，按新规则重算历史
+GET  /api/v1/task-summaries?date=...|project=...     Bearer device token，Agent 任务摘要
 GET  /api/v1/summaries/daily?date=YYYY-MM-DD       Bearer device token
 POST /api/v1/summaries/daily/generate?date=...     Bearer admin token
 GET  /api/v1/healthz                               无鉴权，只返回非敏感状态
 ```
 
-默认每天 22:30 把聚合后的 Session Context 发送给 DeepSeek API，一天一次，结果通过飞书发送。飞书只响应配置的允许用户，并支持今天、昨天、指定项目三类查询，以及问候/身份/能力/「我下班了」的确定性回复。模型或飞书失败不影响事件与 Session。
+默认每天 22:30 把聚合后的 Session Context 发送给 DeepSeek API，一天一次，结果通过飞书发送。飞书只响应配置的允许用户。模型或飞书失败不影响事件与 Session。
 
-V0.1 不实现 Memory、Episode、开放域聊天、Initiative Engine、command、向量检索或管理后台。
+## 问答：AI-first Agent Runtime
+
+问答的默认入口是模型计划，不是正则：用户消息 + Profile + 有限对话状态 + 能力目录
+→ 模型生成 AgentPlan（严格 JSON Schema）→ Policy Gate 审批（工具白名单、参数 schema、
+只读、单轮调用数上限）→ 执行只读能力 → 事实回交模型合成回答 → 代码校验来源与支持等级。
+
+因此同一意图的各种自然语言说法都能生效，加一种说法不需要改 Go 代码。
+模型不可用时只对最明确的数据请求做确定性兜底（`assistant.MinimalFallback`），
+它不是第二套关键词机器人。
+
+`DeniedToolCalls`、`ConversationState`、`MemoryCandidate` 见
+[`internal/storage/conversations.go`](internal/storage/conversations.go)；
+身份配置见 `config.Config.Profile()`。
+
+### 任务摘要（agent.task_summary）
+
+专业 Agent（如 ZCode）通过采集端的 `lumen-desktop task-summary` 提交任务摘要，
+事件走与传感器事件相同的校验、离线队列与幂等入库路径，额外投影到
+`agent_task_summaries` 表（按 `device_id` + `task_id` 幂等 upsert）。
+
+它是目前唯一带**结论**的数据源，因此能力层单独提供 `get_task_summaries`，
+不与 `get_sessions` 合并：混在一起会让「Agent 报告的结论」和「应用时长的推断」
+在回答里分不开。合成阶段的 `support_level` 由代码收紧——只拿到活动记录却
+宣称「完成了某事」会被强制降为 inferred。
+
+只接受元数据级摘要：完整对话、终端输出、代码、diff 与凭证在协议层就没有字段，
+不是传了会被过滤。`privacy_mode` 固定为 `metadata_only`。
+
+V0.1 不实现 Memory 确认入口、Episode、Reflection、Initiative Engine、command、向量检索或管理后台。
+记忆候选会写入 `memory_candidates`（状态恒为 candidate），未经用户确认不进入上下文。
 
 ## Session 切断规则
 

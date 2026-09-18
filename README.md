@@ -21,7 +21,10 @@ Lumen 在 Mac 上低打扰地采集工作元数据，在本地完成最小化和
 | 规则 Session Engine | ✅ 已实现（合并、切断、未分类、迟到重算） |
 | DeepSeek 每日总结 | ✅ 已实现（结构化输出校验、幂等、预算控制） |
 | 总结查询接口 | ✅ 已实现 |
-| 飞书总结推送 + 三类问答 | ✅ 已实现（长连接、白名单、证据引用） |
+| 飞书总结推送 | ✅ 已实现（长连接、白名单、证据引用） |
+| AI-first 问答（Agent Runtime） | ✅ 已实现（模型出计划 → Policy Gate → 只读能力 → 合成回答） |
+| Agent 任务摘要数据源 | ✅ 已实现（ZCode CLI 入口 → 离线队列 → 幂等入库 → get_task_summaries） |
+| 可配置助手身份 | ✅ 已实现（`LUMEN_ASSISTANT_NAME` 等环境变量驱动，代码不写死名字） |
 | 定时任务与保留清理 | ✅ 已实现（22:30 总结、事件清理、每日快照） |
 | 部署文件与备份脚本 | ✅ 已实现 |
 | 真实部署与联调 | ✅ 已部署到 VPS，真实采集→同步→Session→DeepSeek 总结全链路验证通过 |
@@ -47,9 +50,46 @@ make check        # 全部测试 + 静态检查 + 密钥扫描
 - Desktop：Python 后台进程、Window / Idle / Git 传感器、本地 SQLite、隐私过滤、批量同步；
 - Server：Go 单进程、SQLite、设备鉴权、事件写入、规则 Session、每日总结；
 - AI：服务端通过 HTTPS 调用 DeepSeek API，VPS 不部署任何模型；
-- Feishu：每日总结推送，并支持「今天 / 昨天 / 项目」三类最小问答；使用出站长连接，不新增公网回调端口。
+- Feishu：每日总结推送，以及自然语言问答；使用出站长连接，不新增公网回调端口。
 
-明确延期：剪贴板正文、截图/OCR、Episode、长期 Memory、向量检索、通用聊天、主动提醒、服务端下行命令、Tray、Timeline、安装包，以及其他平台。
+## 两类数据源：活动记录 vs Agent 报告
+
+Lumen 的数据分两类，可信度不同，回答里必须分开：
+
+- **活动记录**（`window.activity` / `idle.state` / `git.activity`）：用了哪些应用、
+  各多久、有哪些提交。从它推出的「完成了什么」是**推断**；
+- **Agent 任务摘要**（`agent.task_summary`）：专业 Agent（如 ZCode）自己汇报的
+  任务标题、状态、已产出结果与未完成事项。这是**结论**本身。
+
+因此问「完成了什么」会走 `get_task_summaries`（标 `supported`），
+问「用了什么、多久」走 `get_sessions`（标 `inferred`）。
+如果模型只拿到活动记录却宣称「完成了某事」，代码会强制把支持等级降为 `inferred`
+并在证据行标注来源，用户能自己判断哪部分可信。
+
+接入说明见 [docs/Agent任务摘要接入.md](docs/Agent任务摘要接入.md)。
+
+## 助手是怎么回答问题的（Agent Runtime）
+
+问答不是「正则判意图 → switch 分支 → 固定文案」。默认路径是：
+
+```text
+用户消息 + Profile + 有限对话状态 + 能力目录
+  → 模型生成 AgentPlan（严格 JSON Schema）
+  → Policy Gate 审批（工具白名单、参数 schema、只读、调用数上限）
+  → 执行受限 Capability（只能读到聚合后的时段，拿不到 SQL/Shell/原始事件）
+  → 结果回交模型合成 Answer（标注 supported / inferred / insufficient / conflicted）
+  → 代码校验来源、支持等级与敏感字段
+```
+
+代码不决定「用户这句话是什么意思」，只决定「模型想做的事允不允许做」。
+正则在模型不可用时仅作为最小安全兜底，不是默认入口。
+
+助手身份（名字、定位、称呼、语言、语气、主动性）全部由环境变量驱动，
+换人格不需要改代码：`LUMEN_ASSISTANT_NAME`、`LUMEN_ASSISTANT_ROLE`、
+`LUMEN_OWNER_DISPLAY_NAME`、`LUMEN_ASSISTANT_LANGUAGE`、`LUMEN_ASSISTANT_TONE`、
+`LUMEN_ASSISTANT_PROACTIVITY`。
+
+明确延期：剪贴板正文、截图/OCR、Episode、Reflection、长期 Memory 的确认入口、向量检索、主动提醒、多 Agent 拆分、原生 tool_calls 迁移、服务端下行命令、Tray、Timeline、安装包，以及其他平台。
 
 ## 技术基线
 
@@ -92,14 +132,14 @@ docs/       开发指南
 2. ~~接入 Window / Idle / Git，真实运行一天~~ ✅ 代码就绪，待实际运行观察
 3. ~~用规则生成 Session~~ ✅
 4. ~~每晚调用一次 DeepSeek API 生成总结~~ ✅
-5. ~~接入飞书总结与最小问答~~ ✅ 真机验证通过
+5. ~~接入飞书总结与最小问答~~ ✅ 真机验证通过，问答已改造为 AI-first Agent Runtime
 6. 连续运行 7 天后再决定是否加入剪贴板和长期记忆
 
 ## 长期方向
 
 Lumen 不以通用电脑控制为主线，而是沿着「感知 → 理解 → 记忆 → 沟通 → 谨慎行动」演进：
 
-- V0.2：在三类固定问答上增加自然多轮对话与反馈；
+- V0.2：把记忆候选的确认入口做出来（现在只存候选、不自动晋升），并补多轮追问；
 - V0.3：可控的剪贴板元数据、本地 Timeline 与连接器；
 - V0.4：用户确认、可纠正、可遗忘的长期记忆；
 - V0.5：低打扰且可解释的主动提醒；

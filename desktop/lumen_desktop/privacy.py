@@ -99,15 +99,28 @@ class PrivacyFilter:
 
         context = payload.get("context") or {}
         data = payload.get("data") or {}
+        is_task_summary = payload.get("type") == "agent.task_summary"
 
         for scope, fields in (("context", context), ("data", data)):
             for key, value in fields.items():
                 if isinstance(value, str) and self.contains_sensitive(value):
                     problems.append(f"{scope}.{key} 含路径、URL 或凭证特征")
+                # 任务摘要的条目数组比单个字符串更容易夹带长文本，逐条检查。
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str) and self.contains_sensitive(item):
+                            problems.append(f"{scope}.{key} 含路径、URL 或凭证特征")
 
         # 窗口标题绝不允许出现。
-        for scope, fields in (("context", context), ("data", data)):
-            if "window_title" in fields or "title" in fields:
-                problems.append(f"{scope} 含窗口标题字段")
+        #
+        # data.title 是唯一例外：它是 agent.task_summary 的任务标题。
+        # 例外必须精确到"数据类型 + 字段位置"，否则"允许任务标题"会顺带
+        # 放行窗口标题——那正是这里要防的东西。
+        if "window_title" in context or "window_title" in data:
+            problems.append("含窗口标题字段")
+        if "title" in context:
+            problems.append("context 含窗口标题字段")
+        if "title" in data and not is_task_summary:
+            problems.append("data.title 只允许出现在 agent.task_summary 事件中")
 
         return problems

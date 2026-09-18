@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +34,13 @@ import (
 )
 
 // Version 是当前服务端版本号。
-const Version = "0.1.0"
+//
+// 它是变量而不是常量：构建镜像时由 deploy/Dockerfile 通过
+// -ldflags "-X lumen/server/internal/api.Version=<镜像标签>" 注入。
+// 这样 /api/v1/healthz 报告的就是线上实际运行的版本，
+// 部署后不必靠"某个新接口在不在"来猜版本号。
+// 本地 go run 未注入时显示 dev。
+var Version = "dev"
 
 // Server 组合所有 HTTP 处理依赖。
 type Server struct {
@@ -65,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/events/batch", s.handleBatch)
 	mux.HandleFunc("/api/v1/sessions", s.handleSessions)
 	mux.HandleFunc("/api/v1/sessions/rebuild", s.handleRebuildSessions)
+	mux.HandleFunc("/api/v1/task-summaries", s.handleTaskSummaries)
 	mux.HandleFunc("/api/v1/summaries/daily", s.handleSummary)
 	mux.HandleFunc("/api/v1/summaries/daily/generate", s.handleGenerateSummary)
 	// 只读调试接口：用与飞书问答相同的逻辑处理一句话，便于在不打开飞书的情况下
@@ -338,11 +346,74 @@ func (s *Server) processEvent(ctx context.Context, raw []byte, deviceID, batchID
 		return out
 	}
 
+	// 任务摘要额外投影到 agent_task_summaries。
+	//
+	// 原始事件已经写进 events 表（审计链完整），这里是给查询用的投影：
+	// 同一个 task_id 重复汇报时覆盖旧内容，而不是在事件流里堆多份。
+	// 投影失败不阻塞事件入库——事件已经落盘，用户可以靠重算补齐投影，
+	// 但反过来（丢掉事件）是不可恢复的。
+	if validated.Type == events.TypeAgentTaskSummary {
+		if err := s.projectTaskSummary(ctx, validated, ts); err != nil {
+			s.logger.Error("任务摘要投影失败", "event_id", validated.ID, "error", err.Error())
+			out := rejectedResult(validated.ID,
+				&events.ValidationError{Code: "storage_error", Message: "任务摘要写入失败"})
+			out["retryable"] = true
+			return out
+		}
+	}
+
 	out := map[string]any{"event_id": validated.ID, "status": res.Status}
 	if clockSkew {
 		out["clock_skew"] = true
 	}
 	return out
+}
+
+// projectTaskSummary 把一条校验通过的任务摘要事件投影到查询表。
+//
+// 只取已知字段，不做透传：即使将来协议加了字段，也不会因为这里忘记过滤
+// 而把新内容带进查询表。
+func (s *Server) projectTaskSummary(ctx context.Context, e events.Event, ts time.Time) error {
+	str := func(key string) string {
+		v, _ := e.Data[key].(string)
+		return v
+	}
+	items := func(key string) []string {
+		raw, ok := e.Data[key].([]any)
+		if !ok {
+			return nil
+		}
+		out := make([]string, 0, len(raw))
+		for _, item := range raw {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	}
+
+	_, err := s.store.UpsertTaskSummary(ctx, storage.TaskSummary{
+		ID:              e.ID,
+		DeviceID:        e.DeviceID,
+		TaskID:          str("task_id"),
+		Project:         stringFromContext(e.Context, "project"),
+		App:             stringFromContext(e.Context, "app"),
+		Title:           str("title"),
+		Status:          str("status"),
+		Outcomes:        items("outcomes"),
+		OpenLoops:       items("open_loops"),
+		SourceAgent:     str("source_agent"),
+		SourceSessionID: str("source_session_id"),
+		OccurredAt:      ts,
+		UpdatedAt:       time.Now().UTC(),
+	})
+	return err
+}
+
+// stringFromContext 读取 context 里的字符串字段，缺失时返回空串。
+func stringFromContext(m map[string]any, key string) string {
+	v, _ := m[key].(string)
+	return v
 }
 
 // rebuildAffectedDays 重算新事件影响到的日期。V0.1 按天粒度重算，代价可接受。
@@ -412,6 +483,70 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		"count":    len(list),
 		"sessions": renderSessions(list, s.cfg.Location()),
 	})
+}
+
+// handleTaskSummaries 返回专业 Agent 汇报的任务摘要。
+//
+// 参数：date=YYYY-MM-DD（默认今天）或 project=<名称>；limit 限制条数。
+// 与 /api/v1/sessions 一样用 device token 鉴权：都是"这台设备自己的记录"。
+//
+// source_session_id 会出现在响应里（用于追溯），但**不会**进入模型上下文
+// 或用户可见文本——那是 assistant 层负责过滤的事。
+func (s *Server) handleTaskSummaries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 GET")
+		return
+	}
+	if _, ok := s.authenticate(w, r); !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	loc := s.cfg.Location()
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+
+	var list []storage.TaskSummary
+	var err error
+	var scope map[string]any
+
+	if project := r.URL.Query().Get("project"); project != "" {
+		list, err = s.store.TaskSummariesByProject(ctx, project, limit)
+		scope = map[string]any{"project": project}
+	} else {
+		date := r.URL.Query().Get("date")
+		if date == "" {
+			date = time.Now().In(loc).Format("2006-01-02")
+		}
+		day, perr := time.ParseInLocation("2006-01-02", date, loc)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_date", "date 格式必须是 YYYY-MM-DD")
+			return
+		}
+		list, err = s.store.TaskSummariesBetween(ctx, day, day.AddDate(0, 0, 1), limit)
+		scope = map[string]any{"date": date}
+	}
+	if err != nil {
+		s.logger.Error("查询任务摘要失败", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "查询失败")
+		return
+	}
+
+	out := make([]map[string]any, 0, len(list))
+	for _, t := range list {
+		out = append(out, renderTaskSummary(t, loc))
+	}
+	resp := map[string]any{"count": len(out), "task_summaries": out}
+	for k, v := range scope {
+		resp[k] = v
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleRebuildSessions 重算指定日期范围的 Session。
@@ -633,21 +768,28 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 
-	query := feishu.ParseQuery(req.Text)
-	answer, err := s.qa.Handle(ctx, query)
+	// 走与飞书完全相同的 Agent 路径：模型出计划 → Policy Gate → 执行能力 → 合成。
+	// 这里不再单独解析意图，否则"调试时看到的行为"会与飞书上的真实行为不一致。
+	reply, err := s.qa.Handle(ctx, "debug", req.Text)
 	if err != nil {
-		s.logger.Error("问答处理失败", "intent", query.Intent, "error", err.Error())
+		s.logger.Error("问答处理失败", "error", err.Error())
 		writeError(w, http.StatusInternalServerError, "internal_error", "处理失败")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"question":           req.Text,
-		"intent":             query.Intent,
-		"project":            query.Project,
-		"status":             answer.Status,
-		"used_ai":            answer.UsedAI,
-		"answer":             answer.Text,
-		"source_session_ids": answer.SourceSessionIDs,
+		"mode":               reply.Mode,
+		"status":             reply.Status,
+		"support_level":      reply.SupportLevel,
+		"used_ai":            reply.UsedAI,
+		"answer":             reply.Text,
+		"tool_calls":         reply.ToolCalls,
+		"denied_tools":       reply.DeniedTools,
+		"source_session_ids": reply.SourceSessionIDs,
+		// 任务摘要的来源单独一组：两类来源的可信度不同，合在一起就分不清
+		// 回答里哪些是 Agent 报告的结论、哪些是从活动记录推断的。
+		// 只用于追溯（管理令牌 + 只读），不进用户可见文本。
+		"source_task_ids": reply.SourceTaskIDs,
 	})
 }
 
@@ -737,6 +879,40 @@ func renderSessions(list []storage.Session, loc *time.Location) []map[string]any
 		})
 	}
 	return out
+}
+
+// renderTaskSummary 把任务摘要渲染成 API 响应。
+//
+// 时间同时给 UTC 与本地两种：调用方（含模型上下文组装）不该自己猜时区。
+func renderTaskSummary(t storage.TaskSummary, loc *time.Location) map[string]any {
+	out := map[string]any{
+		"task_id":        t.TaskID,
+		"title":          t.Title,
+		"status":         t.Status,
+		"outcomes":       nonNilList(t.Outcomes),
+		"open_loops":     nonNilList(t.OpenLoops),
+		"source_agent":   t.SourceAgent,
+		"occurred_at":    storage.FormatISO(t.OccurredAt),
+		"occurred_local": t.OccurredAt.In(loc).Format(time.RFC3339),
+	}
+	if t.Project != "" {
+		out["project"] = t.Project
+	}
+	if t.App != "" {
+		out["app"] = t.App
+	}
+	if t.SourceSessionID != "" {
+		out["source_session_id"] = t.SourceSessionID
+	}
+	return out
+}
+
+// nonNilList 保证 JSON 里是 [] 而不是 null，避免调用方把 null 当成"没有数据"。
+func nonNilList(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
 }
 
 func nonEmptyJSON(raw string) string {

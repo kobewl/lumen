@@ -109,8 +109,9 @@ func (b *Bot) handleMessage(ctx context.Context, event *larkim.P2MessageReceiveV
 		// 配对完成后必须关闭该模式（LUMEN_FEISHU_PAIRING_MODE=false）。
 		if b.pairing && senderID != "" {
 			b.logger.Info("配对模式：收到用户消息", "open_id", senderID)
+			// 名字来自配置而不是写死"Lumen"：配对提示也是用户可见文本。
 			b.reply(ctx, senderID,
-				"Lumen 配对模式\n\n你的 open_id 是：\n"+senderID+
+				b.qa.Profile().Name+" 配对模式\n\n你的 open_id 是：\n"+senderID+
 					"\n\n请把它填入服务器的 LUMEN_FEISHU_ALLOWED_USER_IDS，然后关闭配对模式。")
 			return
 		}
@@ -146,19 +147,19 @@ func (b *Bot) handleMessage(ctx context.Context, event *larkim.P2MessageReceiveV
 		return
 	}
 
-	query := ParseQuery(text)
-	answer, err := b.qa.Handle(ctx, query)
+	reply, err := b.qa.Handle(ctx, senderID, text)
 	if err != nil {
-		b.logger.Error("问答处理失败", "intent", query.Intent, "error", err.Error())
-		answer = Answer{Text: "查询时出现内部错误，请稍后再试。", Intent: query.Intent, Status: "error"}
+		b.logger.Error("问答处理失败", "error", err.Error())
+		reply.Text = "我这边出了点问题，请稍后再试。"
+		reply.Status = "error"
 	}
 
 	if messageID != "" {
-		if err := b.qa.RecordConversation(ctx, messageID, senderID, query, answer); err != nil {
+		if err := b.qa.RecordConversation(ctx, messageID, senderID, text, reply); err != nil {
 			b.logger.Warn("问答记录写入失败", "error", err.Error())
 		}
 	}
-	b.reply(ctx, senderID, answer.Text)
+	b.reply(ctx, senderID, reply.Text)
 }
 
 func (b *Bot) reply(ctx context.Context, userID, text string) {

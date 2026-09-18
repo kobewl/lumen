@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"lumen/server/internal/assistant"
 )
 
 // Config 是 lumen-server 的完整运行时配置。
@@ -54,6 +56,18 @@ type Config struct {
 	FeishuPairingMode bool
 	FeishuEnabled     bool
 
+	// 助手身份（AssistantProfile）
+	//
+	// 这些值决定助手怎么称呼自己、怎么称呼用户、用什么语言与语气。
+	// 身份必须是配置而不是代码常量：换一种人格、换一个部署环境应该只改
+	// 环境变量，而不是改代码重新编译。
+	AssistantName      string
+	AssistantRole      string
+	OwnerDisplayName   string
+	AssistantLanguage  string
+	AssistantTone      string
+	AssistantProactive string
+
 	// 限制
 	MaxBatchBytes      int64
 	MaxEventBytes      int64
@@ -80,6 +94,14 @@ func Load() (*Config, error) {
 		FeishuAppID:          os.Getenv("LUMEN_FEISHU_APP_ID"),
 		FeishuAppSecret:      os.Getenv("LUMEN_FEISHU_APP_SECRET"),
 		FeishuConnectionMode: env("LUMEN_FEISHU_CONNECTION_MODE", "long_connection"),
+
+		// 身份默认值是产品名 Lumen + 助手/伙伴定位；留空即使用默认。
+		AssistantName:      env("LUMEN_ASSISTANT_NAME", "Lumen"),
+		AssistantRole:      env("LUMEN_ASSISTANT_ROLE", "个人助手/伙伴"),
+		OwnerDisplayName:   os.Getenv("LUMEN_OWNER_DISPLAY_NAME"),
+		AssistantLanguage:  env("LUMEN_ASSISTANT_LANGUAGE", "zh-CN"),
+		AssistantTone:      env("LUMEN_ASSISTANT_TONE", "友好、简洁、像朋友"),
+		AssistantProactive: env("LUMEN_ASSISTANT_PROACTIVITY", "低：只在被问到或明确需要时回应，不主动打扰"),
 	}
 
 	var err error
@@ -141,6 +163,29 @@ func (c *Config) Location() *time.Location {
 	return loc
 }
 
+// Profile 把身份配置转成 Agent 使用的助手身份。
+//
+// 放在这里而不是 main.go：身份是配置的一部分，转换逻辑只有一处，
+// 测试也可以在不启动服务的情况下验证"改配置是否真的换了身份"。
+//
+// 总结时间被拼进「主动性」描述：这是模型判断"几点会收到总结"的唯一来源。
+// 之前这个时间写死在「我下班了」的固定回复里，改配置就会骗人。
+func (c *Config) Profile() assistant.Profile {
+	proactive := c.AssistantProactive
+	if c.SummaryHour >= 0 && c.SummaryHour <= 23 && c.SummaryMinute >= 0 && c.SummaryMinute <= 59 {
+		proactive = fmt.Sprintf("%s；每天 %02d:%02d 会用当天的完整记录主动发一份总结"+
+			"（在此之前不要替用户提前生成总结）", proactive, c.SummaryHour, c.SummaryMinute)
+	}
+	return assistant.Profile{
+		Name:             c.AssistantName,
+		Role:             c.AssistantRole,
+		OwnerDisplayName: c.OwnerDisplayName,
+		Language:         c.AssistantLanguage,
+		Tone:             c.AssistantTone,
+		Proactivity:      proactive,
+	}.Normalize()
+}
+
 // AIEnabled 表示 DeepSeek 调用是否具备条件。
 func (c *Config) AIEnabled() bool {
 	return c.DeepSeekAPIKey != "" && c.DeepSeekModel != "" && c.DeepSeekBaseURL != ""
@@ -163,6 +208,8 @@ func (c *Config) Redacted() map[string]any {
 		"enroll_enabled":   c.EnrollmentToken != "",
 		"admin_enabled":    c.AdminToken != "",
 		"summary_at":       fmt.Sprintf("%02d:%02d", c.SummaryHour, c.SummaryMinute),
+		"assistant_name":   c.AssistantName,
+		"assistant_role":   c.AssistantRole,
 	}
 }
 

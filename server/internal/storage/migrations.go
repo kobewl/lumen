@@ -126,6 +126,73 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_security_created ON security_events(created_at)`,
 		},
 	},
+	{
+		version: 2,
+		name:    "agent runtime: conversation state and memory candidates",
+		stmts: []string{
+			// conversation_states 保存**有限的**跨轮上下文：当前项目、待澄清问题、
+			// 上一轮的模式与时间范围。刻意不保存完整聊天历史——
+			// 把全部对话塞回模型既贵又容易让模型把旧内容当成事实。
+			`CREATE TABLE IF NOT EXISTS conversation_states (
+				user_id          TEXT PRIMARY KEY,
+				current_project  TEXT NOT NULL DEFAULT '',
+				pending_question TEXT NOT NULL DEFAULT '',
+				last_mode        TEXT NOT NULL DEFAULT '',
+				last_time_range  TEXT NOT NULL DEFAULT '',
+				updated_at       TEXT NOT NULL
+			)`,
+			// memory_candidates 只保存**候选**记忆，绝不直接成为已确认记忆。
+			// 晋升必须由用户确认（V0.1 尚无确认入口，因此全部停留在 candidate）。
+			`CREATE TABLE IF NOT EXISTS memory_candidates (
+				id         TEXT PRIMARY KEY,
+				user_id    TEXT NOT NULL,
+				kind       TEXT NOT NULL,
+				content    TEXT NOT NULL,
+				source_ids TEXT NOT NULL DEFAULT '[]',
+				confidence REAL NOT NULL DEFAULT 0,
+				status     TEXT NOT NULL DEFAULT 'candidate',
+				created_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_memory_user_status ON memory_candidates(user_id, status)`,
+		},
+	},
+	{
+		version: 3,
+		name:    "agent task summaries",
+		stmts: []string{
+			// agent_task_summaries 是专业 Agent 主动汇报的任务摘要。
+			//
+			// 为什么单独建表而不是从 events 里现查：任务摘要是**可更新**的实体
+			// （同一个 task_id 可能被重复汇报，后来者覆盖前者），需要按
+			// (device_id, task_id) 做幂等 upsert；events 表是 append-only 的
+			// 不可变事件流，语义不同，混在一起会让两边的保证都变模糊。
+			//
+			// 原始 event 仍然照常写入 events 表，因此审计链完整：
+			// 这张表是投影，events 是事实来源。
+			`CREATE TABLE IF NOT EXISTS agent_task_summaries (
+				id                TEXT PRIMARY KEY,
+				device_id         TEXT NOT NULL,
+				task_id           TEXT NOT NULL,
+				project           TEXT NOT NULL DEFAULT '',
+				app               TEXT NOT NULL DEFAULT '',
+				title             TEXT NOT NULL,
+				status            TEXT NOT NULL,
+				outcomes_json     TEXT NOT NULL DEFAULT '[]',
+				open_loops_json   TEXT NOT NULL DEFAULT '[]',
+				source_agent      TEXT NOT NULL,
+				source_session_id TEXT NOT NULL DEFAULT '',
+				occurred_at       TEXT NOT NULL,
+				updated_at        TEXT NOT NULL
+			)`,
+			// 幂等键：同一设备上的同一个任务只保留最新一条汇报。
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_task_summaries_task
+				ON agent_task_summaries(device_id, task_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_task_summaries_occurred
+				ON agent_task_summaries(occurred_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_task_summaries_project
+				ON agent_task_summaries(project, occurred_at)`,
+		},
+	},
 }
 
 // Migrate 执行所有未应用的迁移。已执行的迁移会被跳过，因此可重复调用。

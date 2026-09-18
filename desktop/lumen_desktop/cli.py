@@ -10,6 +10,7 @@
   lumen-desktop init-config  生成配置样例
   lumen-desktop events       查看最近事件（自查上传内容）
   lumen-desktop doctor       环境自检
+  lumen-desktop task-summary 提交一条 Agent 任务摘要（供 ZCode 等专业 Agent 调用）
 """
 
 from __future__ import annotations
@@ -21,10 +22,13 @@ import os
 import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG_PATH, Config, default_config_template
+from .event import parse_rfc3339
 from .keychain import delete_token, has_token, load_token, store_token
+from .privacy import PrivacyFilter
 from .runtime import Runtime
 from .storage import Storage
 
@@ -390,6 +394,140 @@ def cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_task_summary(args: argparse.Namespace) -> int:
+    """接收一条 Agent 任务摘要，写入本地离线队列。
+
+    这是专业 Agent（先支持 ZCode）向 Lumen 汇报"我做完了什么"的唯一入口。
+    它只接受元数据：任务 ID、标题、状态、已产出结果、未完成事项。
+    完整对话、终端输出、代码与 diff 不是这个接口的参数——传进来会因为
+    字段 allowlist 直接报错，而不是被静默丢弃。
+
+    设计取舍：写队列而不是直接发网络请求。
+    Agent 可能在没有网络、或 Lumen 采集进程没在跑的时候完成任务；
+    直接发请求会丢数据，而写本地队列由既有的同步循环负责投递、重试与幂等。
+    """
+    from .event import Event, PrivacyError
+    from .ulid import new as new_ulid
+
+    config = Config.load(args.config)
+
+    outcomes = _read_items(args.outcome)
+    open_loops = _read_items(args.open_loop)
+
+    occurred_at = datetime.now(timezone.utc)
+    if args.occurred_at:
+        try:
+            occurred_at = parse_rfc3339(args.occurred_at)
+        except ValueError as exc:
+            print(f"--occurred-at 不是合法的 RFC3339 时间: {exc}", file=sys.stderr)
+            return 2
+
+    device_id = args.device_id or config.device_id
+    storage = Storage(config.db_path)
+    try:
+        storage.set_setting("device_id", device_id)
+        try:
+            event = Event.agent_task_summary(
+                event_id=new_ulid(),
+                device_id=device_id,
+                occurred_at=occurred_at,
+                task_id=args.task_id,
+                title=args.title,
+                source_agent=args.source_agent,
+                status=args.status,
+                outcomes=outcomes,
+                open_loops=open_loops,
+                source_session_id=args.source_session_id or "",
+                project=args.project,
+                app=args.app,
+            )
+        except PrivacyError as exc:
+            # 本地就拒绝，而不是先存下来再依赖服务端拦——隐私问题不该靠远端兜底。
+            print(f"任务摘要被拒绝: {exc}", file=sys.stderr)
+            _record_task_rejected(storage, args, str(exc))
+            return 2
+
+        privacy = PrivacyFilter(config.project_keywords)
+        problems = privacy.validate_payload(event.to_payload())
+        if problems:
+            detail = "；".join(problems)
+            print(f"任务摘要未通过隐私校验: {detail}", file=sys.stderr)
+            _record_task_rejected(storage, args, detail)
+            return 2
+
+        if not storage.store_event(event):
+            # 幂等：同一个 event_id 重复提交不是错误。
+            print(json.dumps({"status": "duplicate", "task_id": args.task_id}, ensure_ascii=False))
+            return 0
+
+        payload = event.to_payload()
+        result = {
+            "status": "queued",
+            "task_id": payload["data"]["task_id"],
+            "event_id": payload["id"],
+            "occurred_at": payload["timestamp"],
+            "queued_bytes": event.size_bytes(),
+        }
+    finally:
+        storage.close()
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print(f"已记录任务摘要：{args.title}")
+        print(f"  task_id   : {result['task_id']}")
+        print(f"  event_id  : {result['event_id']}")
+        print("  状态      : 已进入本地队列，由 Lumen 同步到你的服务器")
+
+    if args.sync_now:
+        return _sync_after_task_summary(config)
+    return 0
+
+
+def _read_items(values: list[str] | None) -> list[str]:
+    """读取条目列表。
+
+    支持两种写法：多次 --outcome "..."，或 --outcome="a\nb" 的多行文本。
+    Agent 通常一次产出多条，两种写法都允许更省事。
+    """
+    if not values:
+        return []
+    out: list[str] = []
+    for raw in values:
+        for line in str(raw).splitlines():
+            line = line.strip()
+            if line:
+                out.append(line)
+    return out
+
+
+def _record_task_rejected(storage: Storage, args: argparse.Namespace, reason: str) -> None:
+    """记录一次被本地拒绝的任务摘要，只记原因不记正文。
+
+    正文可能正是被拒绝的原因（例如夹带了密钥），落盘等于把要防的东西存了下来。
+    """
+    try:
+        storage.set_meta("last_task_summary_error", f"{args.task_id}: {reason}"[:300])
+    except Exception:
+        pass
+
+
+def _sync_after_task_summary(config: Config) -> int:
+    """提交后立即尝试同步一次（可选）。"""
+    token = load_token()
+    if not token:
+        print("（尚未注册设备，摘要已排队，注册后会自动同步）")
+        return 0
+    storage = Storage(config.db_path)
+    try:
+        runtime = Runtime(config, storage, token=token)
+        result = runtime.sync_now()
+    finally:
+        storage.close()
+    print(result["message"])
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """环境自检：依赖、权限、连通性。"""
     config = Config.load(args.config)
@@ -503,6 +641,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_events.add_argument("--limit", type=int, default=20, help="显示条数")
     p_events.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_events.set_defaults(func=cmd_events)
+
+    # 专业 Agent（先支持 ZCode）的提交入口。
+    p_task = sub.add_parser(
+        "task-summary",
+        help="提交一条 Agent 任务摘要（只接受元数据：标题/状态/结果/未完成事项）",
+    )
+    p_task.add_argument("--task-id", required=True, help="任务在来源 Agent 内的稳定 ID（幂等键）")
+    p_task.add_argument("--title", required=True, help="任务标题（单行，最多 120 字）")
+    p_task.add_argument("--status", default="unknown",
+                        choices=["done", "partial", "blocked", "abandoned", "unknown"],
+                        help="任务状态（默认 unknown，不替 Agent 猜结论）")
+    p_task.add_argument("--outcome", action="append",
+                        help="已产出的结果，可多次指定或传多行文本（最多 8 条，每条 120 字）")
+    p_task.add_argument("--open-loop", action="append",
+                        help="未完成事项 / 下一步，可多次指定（最多 8 条）")
+    p_task.add_argument("--project", default=None, help="项目名（命中白名单时才写，不传则不写）")
+    p_task.add_argument("--source-agent", default="zcode-cli", help="来源 Agent 标识")
+    p_task.add_argument("--source-session-id", default=None,
+                        help="来源 Agent 的会话 ID，仅用于追溯，不会展示给用户")
+    p_task.add_argument("--app", default="ZCode", help="产生这个任务的应用名")
+    p_task.add_argument("--occurred-at", default=None, help="发生时间（RFC3339），默认现在")
+    p_task.add_argument("--device-id", default=None, help="覆盖设备 ID")
+    p_task.add_argument("--sync-now", action="store_true", help="提交后立即尝试同步")
+    p_task.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    p_task.set_defaults(func=cmd_task_summary)
 
     p_doctor = sub.add_parser("doctor", help="环境自检")
     p_doctor.set_defaults(func=cmd_doctor)

@@ -45,5 +45,27 @@
       "commit_message": "docs: freeze V0.1 scope",
       "changed_files_count": 4
     }
+  },
+  {
+    "id": "01J9Z4QK7M3F8N2P5R7T9V1X3E",
+    "device_id": "desktop-mac-01",
+    "type": "agent.task_summary",
+    "timestamp": "2026-09-17T09:42:00Z",
+    "privacy": "P1",
+    "context": {
+      "app": "ZCode",
+      "project": "lumen"
+    },
+    "data": {
+      "schema_version": 1,
+      "task_id": "zcode-task-2026-09-17-001",
+      "title": "给事件协议加任务摘要类型",
+      "status": "done",
+      "outcomes": ["新增 agent.task_summary 事件类型", "补齐协议 schema 与 golden 样例"],
+      "open_loops": ["尚未接入真实 Agent 上报"],
+      "source_agent": "zcode-cli",
+      "source_session_id": "sess-9f3c1d8b",
+      "privacy_mode": "metadata_only"
+    }
   }
 ]
