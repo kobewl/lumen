@@ -16,7 +16,14 @@ RUN go mod download
 COPY server/ ./
 # CGO_ENABLED=0 让二进制静态链接，可以直接跑在 scratch/alpine 上。
 # 使用 modernc.org/sqlite（纯 Go 实现），因此不需要 C 编译器。
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/lumen-server ./cmd/lumen-server
+#
+# VERSION 由构建命令传入（--build-arg VERSION=0.1.8），注入后 healthz 报告的
+# 版本就与镜像标签一致，部署后能从接口确认"线上跑的是哪一版"。
+# 忘记传不会构建失败，只是显示 dev。
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w -X lumen/server/internal/api.Version=${VERSION}" \
+    -o /out/lumen-server ./cmd/lumen-server
 
 FROM alpine:3.20
 
