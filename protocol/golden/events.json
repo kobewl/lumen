@@ -1,0 +1,49 @@
+[
+  {
+    "id": "01J9Z4QK7M3F8N2P5R7T9V1X3B",
+    "device_id": "desktop-mac-01",
+    "type": "window.activity",
+    "timestamp": "2026-09-17T08:00:00Z",
+    "privacy": "P0",
+    "context": {
+      "app": "Visual Studio Code",
+      "bundle_id": "com.microsoft.VSCode",
+      "project": "lumen"
+    },
+    "data": {
+      "duration_seconds": 320,
+      "checkpoint": true
+    }
+  },
+  {
+    "id": "01J9Z4QK7M3F8N2P5R7T9V1X3C",
+    "device_id": "desktop-mac-01",
+    "type": "idle.state",
+    "timestamp": "2026-09-17T08:05:20Z",
+    "privacy": "P0",
+    "context": {},
+    "data": {
+      "state": "idle",
+      "schema_version": 2,
+      "duration_seconds": 512
+    }
+  },
+  {
+    "id": "01J9Z4QK7M3F8N2P5R7T9V1X3D",
+    "device_id": "desktop-mac-01",
+    "type": "git.activity",
+    "timestamp": "2026-09-17T08:20:00Z",
+    "privacy": "P1",
+    "context": {
+      "repo": "lumen",
+      "project": "lumen"
+    },
+    "data": {
+      "kind": "commit",
+      "branch": "main",
+      "head_commit": "a1b2c3d4e5f6078899aabbccddeeff0011223344",
+      "commit_message": "docs: freeze V0.1 scope",
+      "changed_files_count": 4
+    }
+  }
+]

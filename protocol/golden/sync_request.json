@@ -1,0 +1,36 @@
+{
+  "device_id": "desktop-mac-01",
+  "batch_id": "01J9Z5A2K4M6P8R0T2V4X6Z8B0",
+  "sent_at": "2026-09-17T10:05:00Z",
+  "events": [
+    {
+      "id": "01J9Z4QK7M3F8N2P5R7T9V1X3B",
+      "device_id": "desktop-mac-01",
+      "type": "window.activity",
+      "timestamp": "2026-09-17T08:00:00Z",
+      "privacy": "P0",
+      "context": {
+        "app": "Visual Studio Code",
+        "bundle_id": "com.microsoft.VSCode",
+        "project": "lumen"
+      },
+      "data": {
+        "duration_seconds": 320,
+        "checkpoint": true
+      }
+    },
+    {
+      "id": "01J9Z4QK7M3F8N2P5R7T9V1X3C",
+      "device_id": "desktop-mac-01",
+      "type": "idle.state",
+      "timestamp": "2026-09-17T08:05:20Z",
+      "privacy": "P0",
+      "context": {},
+      "data": {
+        "state": "idle",
+        "schema_version": 2,
+        "duration_seconds": 512
+      }
+    }
+  ]
+}

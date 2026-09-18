@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lumen.local/schemas/event.schema.json",
+  "title": "Lumen Event",
+  "description": "Desktop 采集并上传的最小化工作元数据事件。字段采用 allowlist，禁止扩展未声明的字段。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "device_id", "type", "timestamp", "privacy", "context", "data"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "客户端生成的 ULID（26 位 Crockford Base32）",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "device_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "type": {
+      "type": "string",
+      "enum": ["window.activity", "idle.state", "git.activity"]
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "事件开始时间（idle.state 为状态区间的开始时间），UTC RFC3339",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "privacy": {
+      "type": "string",
+      "enum": ["P0", "P1"]
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "最小化上下文。禁止出现绝对路径、用户名、URL 和完整窗口标题。",
+      "properties": {
+        "app": { "type": "string", "maxLength": 128 },
+        "bundle_id": { "type": "string", "maxLength": 128 },
+        "project": { "type": "string", "maxLength": 64 },
+        "repo": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "duration_seconds": { "type": "integer", "minimum": 0, "maximum": 86400 },
+        "checkpoint": { "type": "boolean" },
+        "state": { "type": "string", "enum": ["active", "idle", "locked"] },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "idle.state 的区间语义版本。2 表示 timestamp 是区间开始、duration_seconds 是区间长度；缺省视为旧语义（timestamp 是区间结束）。"
+        },
+        "branch": { "type": "string", "maxLength": 128 },
+        "head_commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "commit_message": { "type": "string", "maxLength": 200 },
+        "changed_files_count": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "kind": { "type": "string", "enum": ["commit", "workspace"] }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "window.activity" } } },
+      "then": {
+        "properties": {
+          "privacy": { "const": "P0" },
+          "context": { "required": ["app"] },
+          "data": { "required": ["duration_seconds"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "idle.state" } } },
+      "then": {
+        "properties": {
+          "privacy": { "const": "P0" },
+          "data": { "required": ["state"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "git.activity" } } },
+      "then": {
+        "properties": {
+          "privacy": { "const": "P1" },
+          "context": { "required": ["repo"] },
+          "data": { "required": ["kind"] }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+# Lumen macOS 采集端运行依赖
+# 安装：python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# 只依赖 pyobjc，用于读取前台应用、空闲状态与锁屏状态。
+# 网络请求使用标准库 urllib，SQLite 使用标准库 sqlite3，均无需额外依赖。
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+
+# 开发与测试依赖
+pytest>=8.0

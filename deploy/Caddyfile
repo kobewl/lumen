@@ -1,0 +1,59 @@
+# Caddy 配置：TLS 终止与反向代理
+#
+# V0.1 推荐保持私网访问（Tailscale/WireGuard），不开放公网业务端口。
+# 如果决定公开 443，把下面的域名换成真实域名并确保 DNS 已解析。
+
+{
+	# 邮件用于 ACME 证书通知；不需要可以删除。
+	# email admin@example.com
+
+	# 关闭管理接口的公网暴露。
+	admin off
+
+	log {
+		output stderr
+		format json
+		level INFO
+	}
+}
+
+# 私网部署示例：仅监听 Tailnet 地址或本机地址。
+# 若通过 Tailscale 访问，把 :443 换成你的 Tailnet 主机名，例如 lumen.your-tailnet.ts.net
+:443 {
+	tls internal
+
+	# 请求体大小上限，比其他层更早拒绝超大请求。
+	request_body {
+		max_size 2MB
+	}
+
+	# 安全响应头。
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# 健康检查不需要鉴权，但只返回非敏感状态。
+	handle /api/v1/healthz {
+		reverse_proxy lumen-server:8787
+	}
+
+	# API 统一入口。
+	handle /api/v1/* {
+		reverse_proxy lumen-server:8787 {
+			# 传递真实客户端地址，供服务端记录安全事件来源。
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			# 关闭响应缓冲，避免长请求被截断。
+			flush_interval -1
+		}
+	}
+
+	# 其余路径一律拒绝，V0.1 没有前端页面。
+	handle {
+		respond "Not Found" 404
+	}
+}

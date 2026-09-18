@@ -1,0 +1,85 @@
+# ============================================================
+# Lumen .gitignore
+#
+# 核心原则：运行时业务密钥与本地数据永远不进入 Git。
+# 提交前请执行 `make secrets-check` 做一次检查。
+# ============================================================
+
+# --- macOS ---
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# --- 密钥与本地配置（绝不入库）---
+# 真实配置在服务器 /etc/lumen/lumen.env，仓库里只保留 .example
+.env
+.env.*
+!.env.example
+!lumen.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+secret/
+credentials/
+config.local.*
+lumen.env
+lumen.env.local
+
+# --- 设备凭证与注册产物 ---
+device_secret*
+device_token*
+enrollment_token*
+register.json
+*.token
+
+# --- 本地数据（事件库、备份、日志都不进仓库）---
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+backups/
+screenshots/
+logs/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# --- Go ---
+bin/
+lumen-server
+*.test
+*.out
+vendor/
+
+# --- Node（将来可能用到）---
+node_modules/
+npm-debug.log*
+
+# --- 编辑器 ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 注意：以下锁文件必须提交，不要忽略
+#   go.sum / requirements.txt / package-lock.json

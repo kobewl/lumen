@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumen-desktop"
+version = "0.1.0"
+description = "Lumen macOS 采集端：低打扰记录工作元数据并同步到自有服务器"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# 运行依赖保持最小：pyobjc 用于读取前台应用与空闲状态。
+# 注意：pyobjc 只在 macOS 上可用，因此标记平台条件。
+dependencies = [
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+lumen-desktop = "lumen_desktop.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lumen_desktop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

@@ -1,0 +1,14 @@
+{
+  "batch_id": "01J9Z5A2K4M6P8R0T2V4X6Z8B0",
+  "server_time": "2026-09-17T10:05:01Z",
+  "results": [
+    { "event_id": "01J9Z4QK7M3F8N2P5R7T9V1X3B", "status": "accepted" },
+    { "event_id": "01J9Z4QK7M3F8N2P5R7T9V1X3C", "status": "duplicate" },
+    {
+      "event_id": "01J9Z4QK7M3F8N2P5R7T9V1X3D",
+      "status": "rejected",
+      "code": "invalid_event",
+      "message": "unknown field: absolute_path"
+    }
+  ]
+}

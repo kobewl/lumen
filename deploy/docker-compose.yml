@@ -1,0 +1,63 @@
+# Lumen 服务端 2C2G VPS 部署清单
+#
+# 只运行两个业务容器：caddy 和 lumen-server。
+# 不部署数据库容器、Redis、队列、模型服务或监控大盘。
+#
+# 关键约定：
+#   - 业务密钥只在服务器 /etc/lumen/lumen.env，绝不进入镜像或 Git；
+#   - 该文件通过 env_file 引用服务器本地路径，compose 本身不含任何密钥；
+#   - 数据与备份使用主机目录挂载，容器升级不会覆盖 /etc/lumen 与 /var/lib/lumen。
+
+services:
+  lumen-server:
+    image: ${LUMEN_IMAGE:-ghcr.io/OWNER/lumen-server:latest}
+    container_name: lumen-server
+    restart: unless-stopped
+    env_file:
+      # 服务器本地文件，权限 0640 root:lumen。不存在时 compose 会报错，
+      # 这是有意的失败快停：宁可起不来，也不要静默缺配置。
+      - /etc/lumen/lumen.env
+    volumes:
+      - /var/lib/lumen:/data
+    # 只暴露给 compose 网络，不映射到公网。Caddy 通过服务名访问。
+    expose:
+      - "8787"
+    # 内存上限，防止异常情况下拖垮 2C2G 整机。
+    mem_limit: 400m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - lumen
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: lumen-caddy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - lumen-server
+    mem_limit: 150m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - lumen
+
+networks:
+  lumen:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
