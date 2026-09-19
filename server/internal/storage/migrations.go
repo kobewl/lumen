@@ -193,6 +193,115 @@ var migrations = []migration{
 				ON agent_task_summaries(project, occurred_at)`,
 		},
 	},
+	{
+		version: 4,
+		name:    "agent tool audits",
+		stmts: []string{
+			// tool_audits 是工具调用的审计账本：谁请求的、调了什么、带什么参数、
+			// 放行还是拒绝、为什么、耗时多久、返回了多少条。
+			//
+			// 刻意**不记录结果内容**：结果可能含用户数据，而审计要回答的是
+			// "这一轮发生了什么"，不是"用户的数据长什么样"。
+			// 参数值写入前会被裁剪（只保留前 64 字），因此这里也不会堆积全文。
+			`CREATE TABLE IF NOT EXISTS tool_audits (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				at          TEXT NOT NULL,
+				actor       TEXT NOT NULL DEFAULT '',
+				tool        TEXT NOT NULL,
+				risk        TEXT NOT NULL DEFAULT '',
+				args_json   TEXT NOT NULL DEFAULT '{}',
+				decision    TEXT NOT NULL,
+				reason      TEXT NOT NULL DEFAULT '',
+				duration_ms INTEGER NOT NULL DEFAULT 0,
+				result_kind TEXT NOT NULL DEFAULT '',
+				item_count  INTEGER NOT NULL DEFAULT 0,
+				evidence_n  INTEGER NOT NULL DEFAULT 0,
+				truncated   INTEGER NOT NULL DEFAULT 0
+			)`,
+			// 按时间倒序查最近调用是最常见的审计动作。
+			`CREATE INDEX IF NOT EXISTS idx_tool_audits_at ON tool_audits(at)`,
+			// 按工具与决策统计：用来发现"模型在反复尝试越权"这类模式。
+			`CREATE INDEX IF NOT EXISTS idx_tool_audits_tool ON tool_audits(tool, decision)`,
+		},
+	},
+	{
+		version: 5,
+		name:    "initiative outbox",
+		stmts: []string{
+			// initiative_outbox 是主动关怀的出站账本（出站草稿 + 审计二合一）：
+			// 谁在什么时候、凭什么证据、想说什么、最后发没发出去。
+			//
+			// 刻意**不存**活动明细快照：text 是将发给用户的问题全文（用户本来
+			// 就会看到），evidence/basis 只存可核实的记录 ID。
+			// local_date 是本地时区日期，"每天最多 2 次"按它计数。
+			`CREATE TABLE IF NOT EXISTS initiative_outbox (
+				id           TEXT PRIMARY KEY,
+				user_id      TEXT NOT NULL,
+				local_date   TEXT NOT NULL,
+				created_at   TEXT NOT NULL,
+				status       TEXT NOT NULL,
+				skip_reason  TEXT NOT NULL DEFAULT '',
+				text         TEXT NOT NULL DEFAULT '',
+				basis_json   TEXT NOT NULL DEFAULT '[]',
+				evidence_json TEXT NOT NULL DEFAULT '[]',
+				channel      TEXT NOT NULL DEFAULT '',
+				delivered_at TEXT
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_initiative_user_date
+				ON initiative_outbox(user_id, local_date)`,
+			`CREATE INDEX IF NOT EXISTS idx_initiative_created
+				ON initiative_outbox(created_at)`,
+		},
+	},
+	{
+		version: 6,
+		name:    "memory lifecycle and user profile read model",
+		stmts: []string{
+			// 记忆生命周期：给候选补上决策列。确认/拒绝只追加决策信息，
+			// **不改写**原始候选内容——候选正文永远保持模型当时写下的样子，
+			// 谁在什么时候决定了什么，从这一行就能完整回溯。
+			//
+			// key 是偏好类候选的**稳定槽位名**（如"称呼/作息"）：用户纠正时，
+			// 新确认值替换同一槽位的旧值，而不是堆出两个互相矛盾的值。
+			// 旧库候选 key 为空串，确认时落到 general 槽位。
+			`ALTER TABLE memory_candidates ADD COLUMN key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE memory_candidates ADD COLUMN decided_at TEXT`,
+			`ALTER TABLE memory_candidates ADD COLUMN decided_by TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE memory_candidates ADD COLUMN reject_reason TEXT NOT NULL DEFAULT ''`,
+			// user_profile_entries 是**已确认信息**的读模型（当前值）：
+			// 每个用户每个槽位一行。上下文装配器只读这张表（和摘要/轮次），
+			// 接口层面没有"读候选记忆"的路径，候选正文因此不可能泄漏进模型。
+			`CREATE TABLE IF NOT EXISTS user_profile_entries (
+				user_id             TEXT NOT NULL,
+				key                 TEXT NOT NULL,
+				kind                TEXT NOT NULL DEFAULT 'preference',
+				value               TEXT NOT NULL,
+				version             INTEGER NOT NULL DEFAULT 1,
+				source_candidate_id TEXT NOT NULL DEFAULT '',
+				source_ids_json     TEXT NOT NULL DEFAULT '[]',
+				created_at          TEXT NOT NULL,
+				updated_at          TEXT NOT NULL,
+				PRIMARY KEY (user_id, key)
+			)`,
+			// user_profile_history 是版本历史（兼确认动作审计）：追加式，
+			// 记录每次确认的槽位、新旧值、来源候选与操作者。
+			// 纠正时旧值从这里找回——entries 只留当前值。
+			`CREATE TABLE IF NOT EXISTS user_profile_history (
+				id             INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id        TEXT NOT NULL,
+				key            TEXT NOT NULL,
+				version        INTEGER NOT NULL,
+				action         TEXT NOT NULL,
+				candidate_id   TEXT NOT NULL DEFAULT '',
+				value          TEXT NOT NULL,
+				previous_value TEXT NOT NULL DEFAULT '',
+				operator       TEXT NOT NULL DEFAULT 'admin',
+				created_at     TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_profile_history_user
+				ON user_profile_history(user_id, key, created_at)`,
+		},
+	},
 }
 
 // Migrate 执行所有未应用的迁移。已执行的迁移会被跳过，因此可重复调用。

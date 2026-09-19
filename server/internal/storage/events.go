@@ -135,7 +135,7 @@ func (s *Store) CountEventsInRange(ctx context.Context, from, to time.Time) (int
 
 // TableStats 返回各表行数，用于健康检查与运维观察。
 func (s *Store) TableStats(ctx context.Context) (map[string]int64, error) {
-	tables := []string{"events", "sessions", "daily_summaries", "devices", "conversations"}
+	tables := []string{"events", "sessions", "daily_summaries", "devices", "conversations", "tool_audits"}
 	out := make(map[string]int64, len(tables))
 	for _, t := range tables {
 		var n int64

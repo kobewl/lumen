@@ -22,7 +22,7 @@ Lumen 在 Mac 上低打扰地采集工作元数据，在本地完成最小化和
 | DeepSeek 每日总结 | ✅ 已实现（结构化输出校验、幂等、预算控制） |
 | 总结查询接口 | ✅ 已实现 |
 | 飞书总结推送 | ✅ 已实现（长连接、白名单、证据引用） |
-| AI-first 问答（Agent Runtime） | ✅ 已实现（模型出计划 → Policy Gate → 只读能力 → 合成回答） |
+| AI-first 问答（Agent Runtime） | ✅ 已实现（模型出计划 → 工具执行器（策略 + 审计）→ 合成回答） |
 | Agent 任务摘要数据源 | ✅ 已实现（ZCode CLI 入口 → 离线队列 → 幂等入库 → get_task_summaries） |
 | 可配置助手身份 | ✅ 已实现（`LUMEN_ASSISTANT_NAME` 等环境变量驱动，代码不写死名字） |
 | 定时任务与保留清理 | ✅ 已实现（22:30 总结、事件清理、每日快照） |
@@ -73,16 +73,26 @@ Lumen 的数据分两类，可信度不同，回答里必须分开：
 问答不是「正则判意图 → switch 分支 → 固定文案」。默认路径是：
 
 ```text
-用户消息 + Profile + 有限对话状态 + 能力目录
+用户消息 + 身份 + 有限对话状态 + 工具目录
   → 模型生成 AgentPlan（严格 JSON Schema）
-  → Policy Gate 审批（工具白名单、参数 schema、只读、调用数上限）
-  → 执行受限 Capability（只能读到聚合后的时段，拿不到 SQL/Shell/原始事件）
+  → 工具执行器：策略闸门审批（工具白名单、参数 schema、风险级别、调用数上限）
+  → 执行受限工具（先读后写；来源证据由代码注入）
+  → 每次调用写一条审计（放行 / 拒绝 / 失败）
   → 结果回交模型合成 Answer（标注 supported / inferred / insufficient / conflicted）
   → 代码校验来源、支持等级与敏感字段
 ```
 
 代码不决定「用户这句话是什么意思」，只决定「模型想做的事允不允许做」。
 正则在模型不可用时仅作为最小安全兜底，不是默认入口。
+
+工具是**声明式**的：名称、中文说明、严格参数 schema、结果 schema、风险级别。
+注册表在装配期校验声明（写错就让启动失败），模型只能从目录里选。
+第一批共 8 个工具：7 个只读（当前时间、身份、对话状态、今天摘要、时段查询、
+项目清单、Agent 任务摘要）+ 1 个低风险写入（保存**候选**记忆，必须带来源、不自动晋升）。
+刻意没有任何 SQL、Shell、文件系统或网络工具。
+
+审计落在 `tool_audits` 表：记工具名、风险、清洗后的参数（裁到 64 字）、
+决策与原因、耗时、结果条数与证据条数；**不记结果内容**，也不记用户正文。
 
 助手身份（名字、定位、称呼、语言、语气、主动性）全部由环境变量驱动，
 换人格不需要改代码：`LUMEN_ASSISTANT_NAME`、`LUMEN_ASSISTANT_ROLE`、
@@ -107,11 +117,11 @@ VPS: Caddy + Go + SQLite
 
 ```text
 desktop/    macOS 采集、过滤、本地存储与同步（Python）
-server/     API、事件存储、Session、DeepSeek 总结（Go）
+server/     API、事件存储、Session、DeepSeek 总结、Agent 工具层（Go）
 protocol/   两端共享的 JSON Schema 与 golden 样例
 deploy/     Dockerfile、Caddy、Compose、备份脚本
-scripts/    端到端联调脚本
-docs/       开发指南
+scripts/    端到端联调脚本与本地验收实例
+docs/       开发指南与手工验收
 ```
 
 ## 隐私设计（V0.1 核心约束）

@@ -3,14 +3,16 @@ package assistant
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"lumen/server/internal/ai"
+	"lumen/server/internal/identity"
 	"lumen/server/internal/storage"
+	"lumen/server/internal/tooling"
+	"lumen/server/internal/tools"
 )
 
 // fakePlanner 是测试用的假模型。
@@ -63,7 +65,13 @@ func newTestStore(t *testing.T, date, project string) *storage.Store {
 		t.Fatalf("打开数据库失败: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	seedSession(t, store, date, project)
+	return store
+}
 
+// seedSession 往库里写一条 09:00~10:30 的时段记录。
+func seedSession(t *testing.T, store *storage.Store, date, project string) {
+	t.Helper()
 	start := time.Date(2026, 9, 17, 9, 0, 0, 0, testLoc)
 	if date != "" {
 		parsed, err := time.ParseInLocation("2006-01-02", date, testLoc)
@@ -90,29 +98,70 @@ func newTestStore(t *testing.T, date, project string) *storage.Store {
 		[]storage.Session{sess}); err != nil {
 		t.Fatalf("写入 Session 失败: %v", err)
 	}
-	return store
 }
 
-// newTestAgent 组装一个使用假模型、身份可定制的 Agent。
-func newTestAgent(t *testing.T, store *storage.Store, profile Profile, planner Planner) *Agent {
+// testHarness 是"注册表 + 执行器 + 编排器"的测试装配。
+//
+// 审计写入点用内存实现：测试可以断言"每一次调用都留了痕"，
+// 而不需要真的建库。
+type testHarness struct {
+	agent    *Agent
+	planner  *fakePlanner
+	audit    *tooling.MemorySink
+	registry *tooling.Registry
+	store    *storage.Store
+}
+
+// newHarness 组装一个使用假模型、身份可定制、审计可断言的 Agent。
+func newHarness(t *testing.T, store *storage.Store, profile identity.Profile,
+	planner *fakePlanner, toolSet ...tooling.Tool) *testHarness {
 	t.Helper()
-	return NewAgent(Options{
-		Store:   store,
-		Planner: planner,
-		Registry: NewRegistry(
-			&ProfileCapability{Profile: profile},
-			&TodayStatusCapability{Store: store, Loc: testLoc},
-			&SessionsCapability{Store: store, Loc: testLoc},
-			&KnownProjectsCapability{Store: store, Loc: testLoc, Days: 14},
-			&TaskSummariesCapability{Store: store, Loc: testLoc},
-		),
+
+	if len(toolSet) == 0 {
+		toolSet = tools.All(tools.Options{
+			Store: store, Profile: profile, Location: testLoc,
+		})
+	}
+	registry, err := tooling.NewRegistry(toolSet...)
+	if err != nil {
+		t.Fatalf("构造工具注册表失败: %v", err)
+	}
+	audit := &tooling.MemorySink{}
+	executor, err := tooling.NewExecutor(tooling.ExecutorOptions{
+		Registry: registry, Audit: audit,
+	})
+	if err != nil {
+		t.Fatalf("构造工具执行器失败: %v", err)
+	}
+
+	agent := NewAgent(Options{
+		Store:    store,
+		Planner:  planner,
+		Executor: executor,
 		Profile:  profile,
 		Location: testLoc,
 	})
+	return &testHarness{agent: agent, planner: planner, audit: audit, registry: registry, store: store}
 }
 
-// TestAgentExecutesPlannedCapability 覆盖主链路：模型出计划 → 执行能力 → 合成回答。
-func TestAgentExecutesPlannedCapability(t *testing.T) {
+// newTestAgent 是大多数测试需要的简写。
+func newTestAgent(t *testing.T, store *storage.Store, profile identity.Profile, planner Planner) *Agent {
+	t.Helper()
+	fake, ok := planner.(*fakePlanner)
+	if !ok {
+		t.Fatal("newTestAgent 需要 *fakePlanner")
+	}
+	return newHarness(t, store, profile, fake).agent
+}
+
+// newTaskAgent 使用系统默认身份。
+func newTaskAgent(t *testing.T, store *storage.Store, planner Planner) *Agent {
+	t.Helper()
+	return newTestAgent(t, store, identity.Default(), planner)
+}
+
+// TestAgentExecutesPlannedTool 覆盖主链路：模型出计划 → 执行工具 → 合成回答。
+func TestAgentExecutesPlannedTool(t *testing.T) {
 	today := time.Now().In(testLoc).Format("2006-01-02")
 	store := newTestStore(t, today, "lumen")
 
@@ -123,13 +172,13 @@ func TestAgentExecutesPlannedCapability(t *testing.T) {
 			Understanding: Understanding{
 				Goal: "用户想知道今天的记录", TimeRange: "today", Confidence: 0.9,
 			},
-			ToolCalls: []ToolCall{{Name: "get_today_status"}},
+			ToolCalls: []tooling.Call{{Name: "get_today_status"}},
 		},
 		synth: SynthResult{Answer: "今天主要是 ZCode，约 90 分钟。", SupportLevel: SupportSupported},
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	h := newHarness(t, store, identity.Default(), planner)
 
-	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "今天做了什么"})
+	reply, err := h.agent.Handle(context.Background(), Turn{UserID: "u1", Text: "今天做了什么"})
 	if err != nil {
 		t.Fatalf("处理失败: %v", err)
 	}
@@ -149,9 +198,23 @@ func TestAgentExecutesPlannedCapability(t *testing.T) {
 	if len(reply.SourceSessionIDs) != 1 || reply.SourceSessionIDs[0] != "s_test_session_0001" {
 		t.Fatalf("来源应为真实时段 ID，实际 %v", reply.SourceSessionIDs)
 	}
-	// 能力返回的事实必须真的交给了合成阶段。
+	// 工具返回的事实必须真的交给了合成阶段。
 	if len(planner.synthReqs) != 1 || !strings.Contains(planner.synthReqs[0].UserPrompt, "ZCode") {
-		t.Fatalf("合成阶段应拿到能力返回的事实，实际: %+v", planner.synthReqs)
+		t.Fatalf("合成阶段应拿到工具返回的事实，实际: %+v", planner.synthReqs)
+	}
+	// 审计：这一次调用必须留痕，且决策是放行。
+	records := h.audit.All()
+	if len(records) != 1 {
+		t.Fatalf("应记录 1 条工具审计，实际 %d", len(records))
+	}
+	if records[0].Tool != "get_today_status" || records[0].Decision != tooling.DecisionAllowed {
+		t.Fatalf("审计内容不符: %+v", records[0])
+	}
+	if records[0].Actor != "u1" {
+		t.Fatalf("审计应记录请求者，实际 %q", records[0].Actor)
+	}
+	if records[0].Risk != tooling.RiskRead {
+		t.Fatalf("审计应记录风险级别，实际 %q", records[0].Risk)
 	}
 }
 
@@ -161,7 +224,7 @@ func TestAgentExecutesPlannedCapability(t *testing.T) {
 func TestAgentIdentityComesFromConfiguredProfile(t *testing.T) {
 	store := newTestStore(t, "2026-09-17", "lumen")
 
-	profile := Profile{
+	profile := identity.Profile{
 		Name: "小灯", Role: "学习助手", OwnerDisplayName: "liang",
 		Language: "zh-CN", Tone: "温和", Proactivity: "低",
 	}
@@ -182,18 +245,19 @@ func TestAgentIdentityComesFromConfiguredProfile(t *testing.T) {
 	if len(planner.planReqs) != 1 {
 		t.Fatal("应调用过一次规划")
 	}
-	systemPrompt := planner.planReqs[0].SystemPrompt
-	if !strings.Contains(systemPrompt, "小灯") {
-		t.Fatalf("规划提示词应注入配置的名字，实际: %s", systemPrompt)
+	// 身份现在由装配器注入 trusted_context（用户侧提示词），系统提示只留规则。
+	userPrompt := planner.planReqs[0].UserPrompt
+	if !strings.Contains(userPrompt, "小灯") {
+		t.Fatalf("规划提示词的可信块应注入配置的名字，实际: %s", userPrompt)
 	}
-	if !strings.Contains(systemPrompt, "学习助手") {
-		t.Fatalf("规划提示词应注入配置的定位，实际: %s", systemPrompt)
+	if !strings.Contains(userPrompt, "学习助手") {
+		t.Fatalf("规划提示词的可信块应注入配置的定位，实际: %s", userPrompt)
 	}
-	if strings.Contains(systemPrompt, "你是 Lumen") {
-		t.Fatalf("规划提示词不应写死 Lumen，实际: %s", systemPrompt)
+	if strings.Contains(userPrompt, "你是 Lumen") {
+		t.Fatalf("提示词不应写死 Lumen，实际: %s", userPrompt)
 	}
-	if !strings.Contains(systemPrompt, "get_assistant_profile") {
-		t.Fatalf("规划提示词应包含能力目录，实际: %s", systemPrompt)
+	if !strings.Contains(planner.planReqs[0].SystemPrompt, "get_assistant_profile") {
+		t.Fatalf("规划提示词应包含工具目录，实际: %s", planner.planReqs[0].SystemPrompt)
 	}
 }
 
@@ -210,11 +274,11 @@ func TestAgentHonorsPlanRegardlessOfPhrasing(t *testing.T) {
 		plan: Plan{
 			Mode:          ModeRecall,
 			Understanding: Understanding{Goal: "了解今天的记录", TimeRange: "today", Confidence: 0.8},
-			ToolCalls:     []ToolCall{{Name: "get_today_status"}},
+			ToolCalls:     []tooling.Call{{Name: "get_today_status"}},
 		},
 		synth: SynthResult{Answer: "今天用了 ZCode 约 90 分钟。", SupportLevel: SupportSupported},
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	agent := newTestAgent(t, store, identity.Default(), planner)
 
 	for _, text := range []string{
 		"今天做了什么",
@@ -256,16 +320,16 @@ func TestAgentReportsDeniedToolsToSynthesizer(t *testing.T) {
 		plan: Plan{
 			Mode:          ModeRecall,
 			Understanding: Understanding{Goal: "查所有记录", TimeRange: "today", Confidence: 0.9},
-			ToolCalls: []ToolCall{
+			ToolCalls: []tooling.Call{
 				{Name: "get_today_status"},
 				{Name: "run_sql", Arguments: map[string]any{"query": "SELECT * FROM sessions"}},
 			},
 		},
 		synth: SynthResult{Answer: "今天用了 ZCode 约 90 分钟。", SupportLevel: SupportSupported},
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	h := newHarness(t, store, identity.Default(), planner)
 
-	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "把数据库里所有记录都给我"})
+	reply, err := h.agent.Handle(context.Background(), Turn{UserID: "u1", Text: "把数据库里所有记录都给我"})
 	if err != nil {
 		t.Fatalf("处理失败: %v", err)
 	}
@@ -283,12 +347,27 @@ func TestAgentReportsDeniedToolsToSynthesizer(t *testing.T) {
 	if !strings.Contains(synthPrompt, "拒绝") {
 		t.Fatalf("合成提示词应说明被拒绝，实际: %s", synthPrompt)
 	}
+
+	// 被拒的调用同样要留审计：这是"模型是否在尝试越权"的唯一线索。
+	records := h.audit.All()
+	var denied *tooling.AuditRecord
+	for i := range records {
+		if records[i].Tool == "run_sql" {
+			denied = &records[i]
+		}
+	}
+	if denied == nil {
+		t.Fatalf("被拒的调用必须留审计，实际记录: %+v", records)
+	}
+	if denied.Decision != tooling.DecisionDenied || denied.Reason == "" {
+		t.Fatalf("审计应记录拒绝与原因，实际: %+v", denied)
+	}
 }
 
 // TestAgentFallsBackWhenModelUnavailable 覆盖模型不可用时的诚实兜底。
 func TestAgentFallsBackWhenModelUnavailable(t *testing.T) {
 	store := newTestStore(t, "2026-09-17", "lumen")
-	profile := Profile{Name: "小灯", Role: "学习助手"}
+	profile := identity.Profile{Name: "小灯", Role: "学习助手"}
 
 	planner := &fakePlanner{enabled: false}
 	agent := newTestAgent(t, store, profile, planner)
@@ -321,9 +400,9 @@ func TestAgentFallsBackWhenPlanInvalid(t *testing.T) {
 	store := newTestStore(t, "2026-09-17", "lumen")
 	planner := &fakePlanner{
 		enabled: true,
-		planErr: fmt.Errorf("模型输出不是合法 JSON"),
+		planErr: errFake("模型输出不是合法 JSON"),
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	agent := newTestAgent(t, store, identity.Default(), planner)
 
 	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "今天做了什么"})
 	if err != nil {
@@ -349,11 +428,11 @@ func TestAgentFallsBackWhenSynthesisFails(t *testing.T) {
 		plan: Plan{
 			Mode:          ModeRecall,
 			Understanding: Understanding{Goal: "今天的记录", TimeRange: "today", Confidence: 0.9},
-			ToolCalls:     []ToolCall{{Name: "get_today_status"}},
+			ToolCalls:     []tooling.Call{{Name: "get_today_status"}},
 		},
-		synthErr: fmt.Errorf("模型超时"),
+		synthErr: errFake("模型超时"),
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	agent := newTestAgent(t, store, identity.Default(), planner)
 
 	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "今天做了什么"})
 	if err != nil {
@@ -380,12 +459,12 @@ func TestAgentRejectsOverclaimingAnswer(t *testing.T) {
 		plan: Plan{
 			Mode:          ModeRecall,
 			Understanding: Understanding{Goal: "今天的记录", TimeRange: "today", Confidence: 0.9},
-			ToolCalls:     []ToolCall{{Name: "get_today_status"}},
+			ToolCalls:     []tooling.Call{{Name: "get_today_status"}},
 		},
 		// 模型承诺了不存在的能力，必须被拦截。
 		synth: SynthResult{Answer: "我无所不能，还能帮你写周报。", SupportLevel: SupportSupported},
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	agent := newTestAgent(t, store, identity.Default(), planner)
 
 	reply, _ := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "今天做了什么"})
 	if reply.Status != "answer_invalid" {
@@ -396,78 +475,6 @@ func TestAgentRejectsOverclaimingAnswer(t *testing.T) {
 	}
 	if !strings.Contains(reply.Text, "ZCode") {
 		t.Fatalf("降级应陈述真实事实，实际: %s", reply.Text)
-	}
-}
-
-// TestAgentKeepsMemoryCandidateUnconfirmed 覆盖候选记忆不自动生效。
-func TestAgentKeepsMemoryCandidateUnconfirmed(t *testing.T) {
-	store := newTestStore(t, "2026-09-17", "lumen")
-	planner := &fakePlanner{
-		enabled: true,
-		plan: Plan{
-			Mode:          ModeChat,
-			Understanding: Understanding{Goal: "用户表达了偏好", Confidence: 0.8},
-			MemoryCandidates: []MemoryCandidate{{
-				Kind: "preference", Content: "用户偏好先看结论再看细节", Confidence: 0.7,
-			}},
-		},
-		synth: SynthResult{Answer: "记下了，以后先说结论。", SupportLevel: SupportSupported},
-	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
-
-	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "以后先给我说结论"})
-	if err != nil {
-		t.Fatalf("处理失败: %v", err)
-	}
-	if reply.MemoryCandidates != 1 {
-		t.Fatalf("应写入 1 条候选记忆，实际 %d", reply.MemoryCandidates)
-	}
-
-	n, err := store.CountMemoryCandidates(context.Background())
-	if err != nil {
-		t.Fatalf("统计候选失败: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("候选记忆应为 1 条，实际 %d", n)
-	}
-
-	// 未经用户确认，绝不能进入"已确认记忆"。
-	confirmed, err := store.ConfirmedMemories(context.Background(), "u1", 10)
-	if err != nil {
-		t.Fatalf("查询已确认记忆失败: %v", err)
-	}
-	if len(confirmed) != 0 {
-		t.Fatalf("候选记忆不应自动晋升为已确认，实际 %d 条", len(confirmed))
-	}
-}
-
-// TestAgentRejectsSensitiveMemoryCandidate 覆盖疑似凭证的候选记忆被拒绝。
-func TestAgentRejectsSensitiveMemoryCandidate(t *testing.T) {
-	store := newTestStore(t, "2026-09-17", "lumen")
-	planner := &fakePlanner{
-		enabled: true,
-		plan: Plan{
-			Mode:          ModeChat,
-			Understanding: Understanding{Goal: "用户说了点什么", Confidence: 0.6},
-			MemoryCandidates: []MemoryCandidate{
-				{Kind: "fact", Content: "用户的 API key 是 sk-abcdef123456", Confidence: 0.9},
-				{Kind: "fact", Content: "用户的密码是 hunter2", Confidence: 0.9},
-			},
-		},
-		synth: SynthResult{Answer: "好的。", SupportLevel: SupportSupported},
-	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
-
-	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "记一下我的密钥"})
-	if err != nil {
-		t.Fatalf("处理失败: %v", err)
-	}
-	if reply.MemoryCandidates != 0 {
-		t.Fatalf("疑似凭证的内容不应落库，实际写入 %d 条", reply.MemoryCandidates)
-	}
-	n, _ := store.CountMemoryCandidates(context.Background())
-	if n != 0 {
-		t.Fatalf("疑似凭证的内容不应落库，实际 %d 条", n)
 	}
 }
 
@@ -482,11 +489,11 @@ func TestAgentSavesLimitedConversationState(t *testing.T) {
 				Goal: "用户想知道 lumen 项目的进展", Entities: []string{"lumen"},
 				TimeRange: "last_7_days", Confidence: 0.9,
 			},
-			ToolCalls: []ToolCall{{Name: "get_sessions", Arguments: map[string]any{"project": "lumen"}}},
+			ToolCalls: []tooling.Call{{Name: "get_sessions", Arguments: map[string]any{"project": "lumen"}}},
 		},
 		synth: SynthResult{Answer: "lumen 最近有 1 段记录。", SupportLevel: SupportSupported},
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	agent := newTestAgent(t, store, identity.Default(), planner)
 
 	if _, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "lumen 项目最近怎么样"}); err != nil {
 		t.Fatalf("处理失败: %v", err)
@@ -520,7 +527,7 @@ func TestAgentClarifySkipsSecondModelCall(t *testing.T) {
 			ClarificationQuestion: "你指的是哪个项目？",
 		},
 	}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	agent := newTestAgent(t, store, identity.Default(), planner)
 
 	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "那个项目怎么样了"})
 	if err != nil {
@@ -547,7 +554,7 @@ func TestAgentClarifySkipsSecondModelCall(t *testing.T) {
 func TestAgentEmptyInputDoesNotCallModel(t *testing.T) {
 	store := newTestStore(t, "2026-09-17", "lumen")
 	planner := &fakePlanner{enabled: true}
-	agent := newTestAgent(t, store, DefaultProfile(), planner)
+	agent := newTestAgent(t, store, identity.Default(), planner)
 
 	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "   "})
 	if err != nil {
@@ -561,18 +568,70 @@ func TestAgentEmptyInputDoesNotCallModel(t *testing.T) {
 	}
 }
 
-// TestValidMemoryContentRejectsCredentials 覆盖候选记忆的敏感内容过滤。
-func TestValidMemoryContentRejectsCredentials(t *testing.T) {
-	bad := []string{
-		"sk-abcdef123456", "api_key=xxx", "token: abc", "我的密码是 123456",
-		"unclassified 项目", "a",
+// TestAgentWithMissingExecutorStillAnswers 覆盖执行器缺失时整条链路仍能作答。
+//
+// 端到端行为：不 panic、不执行任何工具、如实说明这一步没做成。
+func TestAgentWithMissingExecutorStillAnswers(t *testing.T) {
+	store := newTestStore(t, "2026-09-17", "lumen")
+	planner := &fakePlanner{
+		enabled: true,
+		plan: Plan{
+			Mode: ModeRecall,
+			Understanding: Understanding{
+				Goal: "查今天的记录", TimeRange: "today", Confidence: 0.9,
+			},
+			ToolCalls: []tooling.Call{{Name: "get_today_status"}},
+		},
+		synth: SynthResult{Answer: "没查到记录。", SupportLevel: SupportInsufficient},
 	}
-	for _, content := range bad {
-		if validMemoryContent(content) {
-			t.Fatalf("不应接受 %q 作为候选记忆", content)
+	agent := NewAgent(Options{
+		Store:    store,
+		Planner:  planner,
+		Executor: nil, // 装配漏了执行器
+		Profile:  identity.Default(),
+		Location: testLoc,
+	})
+
+	reply, err := agent.Handle(context.Background(), Turn{UserID: "u1", Text: "今天做了什么"})
+	if err != nil {
+		t.Fatalf("执行器缺失不应返回错误: %v", err)
+	}
+	if len(reply.DeniedTools) == 0 {
+		t.Fatal("应把被拒绝的调用如实告知用户与审计")
+	}
+	if len(reply.SourceSessionIDs) != 0 {
+		t.Fatal("没有执行任何工具时不应凭空产生来源")
+	}
+	// 必须告诉模型这一步没做成，否则它会以为"查过了但没有数据"。
+	synthPrompt := planner.synthReqs[0].UserPrompt
+	if !strings.Contains(synthPrompt, "执行器未初始化") {
+		t.Fatalf("合成提示词应说明被拒原因，实际: %s", synthPrompt)
+	}
+}
+
+// TestAgentToolCatalogComesFromRegistry 覆盖工具目录确实来自注册表。
+//
+// 目录是"模型能自己发现新工具"的机制：注册表里有的工具必须出现在提示词里，
+// 注册表里没有的不可能出现。
+func TestAgentToolCatalogComesFromRegistry(t *testing.T) {
+	store := newTestStore(t, "2026-09-17", "lumen")
+	planner := &fakePlanner{
+		enabled: true,
+		plan:    Plan{Mode: ModeChat, Understanding: Understanding{Confidence: 0.9}},
+		synth:   SynthResult{Answer: "好。", SupportLevel: SupportSupported},
+	}
+	h := newHarness(t, store, identity.Default(), planner)
+
+	if _, err := h.agent.Handle(context.Background(), Turn{UserID: "u1", Text: "你好"}); err != nil {
+		t.Fatalf("处理失败: %v", err)
+	}
+	system := planner.planReqs[0].SystemPrompt
+	for _, name := range h.registry.Names() {
+		if !strings.Contains(system, name) {
+			t.Fatalf("工具目录应包含 %s，实际: %s", name, system)
 		}
 	}
-	if !validMemoryContent("用户偏好先看结论") {
-		t.Fatal("正常内容应被接受")
+	if strings.Contains(system, "run_sql") {
+		t.Fatal("目录里不应出现未注册的工具名")
 	}
 }

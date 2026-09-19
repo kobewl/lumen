@@ -11,7 +11,9 @@ import (
 	"lumen/server/internal/ai"
 	"lumen/server/internal/assistant"
 	"lumen/server/internal/config"
+	"lumen/server/internal/identity"
 	"lumen/server/internal/storage"
+	"lumen/server/internal/tooling"
 )
 
 var testLoc = func() *time.Location {
@@ -86,7 +88,7 @@ func newQAStore(t *testing.T, date, project string) *storage.Store {
 }
 
 func newTestService(t *testing.T, store *storage.Store, planner assistant.Planner,
-	profile assistant.Profile) *QAService {
+	profile identity.Profile) *QAService {
 	t.Helper()
 	svc := NewQAService(QAServiceOptions{
 		Store: store, Planner: planner, Loc: testLoc, Profile: profile, QueryDailyLimit: 20,
@@ -97,7 +99,7 @@ func newTestService(t *testing.T, store *storage.Store, planner assistant.Planne
 	return svc
 }
 
-// extractFactValue 从合成阶段的用户提示里取出能力返回的事实字段。
+// nameFromPrompt 从合成阶段的用户提示里取出身份字段。
 //
 // 用它做断言而不是比对固定文案：验证的是"事实确实流到了模型手上"，
 // 而不是模型最终怎么措辞。
@@ -117,7 +119,7 @@ func nameFromPrompt(req assistant.SynthesizeRequest) string {
 
 // TestIdentityComesFromConfigNotCode 覆盖身份端到端由配置决定。
 //
-// 断言链条：改 LUMEN_ASSISTANT_NAME → Config.Profile() → 能力目录 →
+// 断言链条：改 LUMEN_ASSISTANT_NAME → Config.Profile() → 工具目录 →
 // 模型提示词 → 回答。任何一处写死 Lumen 都会让这个测试失败。
 func TestIdentityComesFromConfigNotCode(t *testing.T) {
 	store := newQAStore(t, "2026-09-17", "lumen")
@@ -136,7 +138,7 @@ func TestIdentityComesFromConfigNotCode(t *testing.T) {
 				Mode:          assistant.ModeChat,
 				Understanding: assistant.Understanding{Goal: "问助手是谁", Confidence: 0.9},
 				// 身份必须来自 get_assistant_profile，而不是模型凭提示词编造。
-				ToolCalls: []assistant.ToolCall{{Name: "get_assistant_profile"}},
+				ToolCalls: []tooling.Call{{Name: "get_assistant_profile"}},
 			},
 			synthFn: func(req assistant.SynthesizeRequest) assistant.SynthResult {
 				got := nameFromPrompt(req)
@@ -163,8 +165,10 @@ func TestIdentityComesFromConfigNotCode(t *testing.T) {
 		if len(planner.planReqs) != 1 {
 			t.Fatalf("%s: 应调用一次规划", name)
 		}
-		if !strings.Contains(planner.planReqs[0].SystemPrompt, name) {
-			t.Fatalf("%s: 规划提示词应含配置的名字", name)
+		// 身份现在随 trusted_context 走（装配器渲染），不再拼在系统提示里；
+		// 配置改名必须反映到规划提示词的可信块中。
+		if !strings.Contains(planner.planReqs[0].UserPrompt, name) {
+			t.Fatalf("%s: 规划提示词的可信块应含配置的名字", name)
 		}
 	}
 }
@@ -185,7 +189,7 @@ func TestHandlePassesRawTextToModel(t *testing.T) {
 			return assistant.SynthResult{Answer: "嗨，我在。", SupportLevel: assistant.SupportSupported}
 		},
 	}
-	svc := newTestService(t, store, planner, assistant.DefaultProfile())
+	svc := newTestService(t, store, planner, identity.Default())
 
 	texts := []string{"你好", "在吗", "早上好呀", "帮我写一份周报", "嗯……那个呢"}
 	for _, text := range texts {
@@ -213,13 +217,13 @@ func TestRecallPathReturnsRealSources(t *testing.T) {
 		plan: assistant.Plan{
 			Mode:          assistant.ModeRecall,
 			Understanding: assistant.Understanding{Goal: "今天的记录", TimeRange: "today", Confidence: 0.9},
-			ToolCalls:     []assistant.ToolCall{{Name: "get_today_status"}},
+			ToolCalls:     []tooling.Call{{Name: "get_today_status"}},
 		},
 		synthFn: func(assistant.SynthesizeRequest) assistant.SynthResult {
 			return assistant.SynthResult{Answer: "今天用 ZCode 约 90 分钟。", SupportLevel: assistant.SupportSupported}
 		},
 	}
-	svc := newTestService(t, store, planner, assistant.DefaultProfile())
+	svc := newTestService(t, store, planner, identity.Default())
 
 	reply, err := svc.Handle(context.Background(), "u1", "今天做了什么")
 	if err != nil {
@@ -236,14 +240,95 @@ func TestRecallPathReturnsRealSources(t *testing.T) {
 	}
 }
 
+// TestToolAuditReachesStore 覆盖审计真正落到存储。
+//
+// 这一条是"审计不是摆设"的端到端证明：装配里接的是 SQLite 写入点，
+// 一次问答之后审计表里必须有对应的记录（含被拒的调用）。
+func TestToolAuditReachesStore(t *testing.T) {
+	today := time.Now().In(testLoc).Format("2006-01-02")
+	store := newQAStore(t, today, "lumen")
+
+	planner := &fakePlanner{
+		enabled: true,
+		plan: assistant.Plan{
+			Mode:          assistant.ModeRecall,
+			Understanding: assistant.Understanding{Goal: "查记录", TimeRange: "today", Confidence: 0.9},
+			ToolCalls: []tooling.Call{
+				{Name: "get_today_status"},
+				{Name: "run_sql", Arguments: map[string]any{"query": "SELECT * FROM events"}},
+			},
+		},
+		synthFn: func(assistant.SynthesizeRequest) assistant.SynthResult {
+			return assistant.SynthResult{Answer: "今天用 ZCode 约 90 分钟。", SupportLevel: assistant.SupportSupported}
+		},
+	}
+	svc := NewQAService(QAServiceOptions{
+		Store: store, Planner: planner, Loc: testLoc, Profile: identity.Default(),
+		QueryDailyLimit: 20,
+		Audit:           storage.ToolAuditSink{Store: store},
+	})
+
+	if _, err := svc.Handle(context.Background(), "u1", "今天做了什么"); err != nil {
+		t.Fatalf("处理失败: %v", err)
+	}
+
+	audits, err := store.RecentToolAudits(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("读取审计失败: %v", err)
+	}
+	if len(audits) != 2 {
+		t.Fatalf("应落 2 条审计（1 放行 + 1 拒绝），实际 %d 条: %+v", len(audits), audits)
+	}
+
+	var allowed, denied *storage.ToolAudit
+	for i := range audits {
+		switch audits[i].Tool {
+		case "get_today_status":
+			allowed = &audits[i]
+		case "run_sql":
+			denied = &audits[i]
+		}
+	}
+	if allowed == nil || allowed.Decision != tooling.DecisionAllowed {
+		t.Fatalf("放行的调用应落审计，实际 %+v", audits)
+	}
+	if denied == nil || denied.Decision != tooling.DecisionDenied || denied.Reason == "" {
+		t.Fatalf("被拒的调用应落审计并带原因，实际 %+v", audits)
+	}
+	if allowed.Actor != "u1" {
+		t.Fatalf("审计应记录请求者，实际 %q", allowed.Actor)
+	}
+}
+
+// TestToolCatalogIsExposed 覆盖工具目录可从服务层读出。
+func TestToolCatalogIsExposed(t *testing.T) {
+	store := newQAStore(t, "2026-09-17", "lumen")
+	svc := newTestService(t, store, &fakePlanner{enabled: false}, identity.Default())
+
+	catalog := svc.ToolCatalog()
+	for _, want := range []string{"get_current_time", "get_sessions", "save_memory_candidate"} {
+		if !strings.Contains(catalog, want) {
+			t.Fatalf("工具目录应包含 %s，实际:\n%s", want, catalog)
+		}
+	}
+	registry := svc.Agent().ToolRegistry()
+	if registry == nil || registry.Len() != 8 {
+		t.Fatalf("应暴露 8 个工具的注册表，实际 %v", registry)
+	}
+}
+
 // TestFallbackKeepsDataQueryAnswerable 覆盖模型不可用时的数据兜底。
 //
 // 模型不可用时如果连"今天做了什么"都答不了，用户会以为记录丢了。
+// 兜底走的是同一个工具执行器，因此照样过策略、照样留审计。
 func TestFallbackKeepsDataQueryAnswerable(t *testing.T) {
 	today := time.Now().In(testLoc).Format("2006-01-02")
 	store := newQAStore(t, today, "lumen")
 	planner := &fakePlanner{enabled: false}
-	svc := newTestService(t, store, planner, assistant.DefaultProfile())
+	svc := NewQAService(QAServiceOptions{
+		Store: store, Planner: planner, Loc: testLoc, Profile: identity.Default(),
+		QueryDailyLimit: 20, Audit: storage.ToolAuditSink{Store: store},
+	})
 
 	reply, err := svc.Handle(context.Background(), "u1", "今天做了什么")
 	if err != nil {
@@ -255,6 +340,14 @@ func TestFallbackKeepsDataQueryAnswerable(t *testing.T) {
 	if !strings.Contains(reply.Text, "ZCode") {
 		t.Fatalf("兜底应给出真实事实，实际: %s", reply.Text)
 	}
+	// 兜底也必须留审计：否则"模型不可用时的数据读取"会成为审计盲区。
+	audits, err := store.RecentToolAudits(context.Background(), 10)
+	if err != nil || len(audits) == 0 {
+		t.Fatalf("兜底路径也应留审计，实际 %d 条 (%v)", len(audits), err)
+	}
+	if audits[0].Tool != "get_today_status" || audits[0].Decision != tooling.DecisionAllowed {
+		t.Fatalf("兜底审计内容不符: %+v", audits[0])
+	}
 }
 
 // TestFallbackIsHonestForOtherMessages 覆盖兜底不冒充能力。
@@ -263,7 +356,7 @@ func TestFallbackKeepsDataQueryAnswerable(t *testing.T) {
 func TestFallbackIsHonestForOtherMessages(t *testing.T) {
 	store := newQAStore(t, "2026-09-17", "lumen")
 	planner := &fakePlanner{enabled: false}
-	profile := assistant.Profile{Name: "小灯", Role: "学习助手"}
+	profile := identity.Profile{Name: "小灯", Role: "学习助手"}
 	svc := newTestService(t, store, planner, profile)
 
 	reply, err := svc.Handle(context.Background(), "u1", "你好")
@@ -285,7 +378,7 @@ func TestFallbackIsHonestForOtherMessages(t *testing.T) {
 func TestRecordConversationKeepsModeAndSources(t *testing.T) {
 	store := newQAStore(t, "2026-09-17", "lumen")
 	planner := &fakePlanner{enabled: false}
-	svc := newTestService(t, store, planner, assistant.DefaultProfile())
+	svc := newTestService(t, store, planner, identity.Default())
 
 	ctx := context.Background()
 	reply, err := svc.Handle(ctx, "u1", "今天做了什么")
@@ -328,7 +421,7 @@ func TestBudgetExhaustionSkipsModel(t *testing.T) {
 	}
 	svc := NewQAService(QAServiceOptions{
 		Store: store, Planner: planner, Loc: testLoc,
-		Profile: assistant.DefaultProfile(), QueryDailyLimit: 1,
+		Profile: identity.Default(), QueryDailyLimit: 1,
 	})
 
 	if _, err := svc.Handle(ctx, "u1", "你好"); err != nil {
@@ -351,4 +444,35 @@ func TestProjectDisplayName(t *testing.T) {
 			t.Fatalf("ProjectDisplayName(%q) 应为 %q，实际 %q", in, want, got)
 		}
 	}
+}
+
+// TestQAServiceRejectsInvalidTools 覆盖装配期暴露非法工具声明。
+//
+// 工具声明写错说明代码有问题，必须在启动时失败，
+// 而不是静默降级成一个"什么工具都没有"的助手。
+func TestQAServiceRejectsInvalidTools(t *testing.T) {
+	store := newQAStore(t, "2026-09-17", "lumen")
+	defer func() {
+		if rec := recover(); rec == nil {
+			t.Fatal("非法工具声明应让构造失败")
+		}
+	}()
+	NewQAService(QAServiceOptions{
+		Store: store, Loc: testLoc, Profile: identity.Default(),
+		Tools: []tooling.Tool{badTool{}},
+	})
+}
+
+// badTool 声明一个不合法的工具名，用于验证装配期校验。
+type badTool struct{}
+
+func (badTool) Spec() tooling.Spec {
+	return tooling.Spec{
+		Name: "Not Valid", Summary: "非法工具", ResultSchema: `{}`,
+		Kind: tooling.KindActivity, Risk: tooling.RiskRead,
+	}
+}
+
+func (badTool) Execute(context.Context, tooling.Invocation) (tooling.Result, error) {
+	return tooling.Result{}, nil
 }

@@ -14,13 +14,21 @@ sessions/       规则 Session 聚合（唯一允许切分会话的地方）
 ai/             DeepSeek 客户端、上下文组装、输出校验、文本渲染
 summary/        总结编排：幂等申请 → 调用 → 持久化 → 推送
 scheduler/      每日总结、事件清理、WAL checkpoint、数据库快照
-assistant/      Agent Runtime：Profile、AgentPlan、Policy Gate、能力注册表、合成与校验
+identity/       助手身份（名字/定位/语气）：提示词、工具与配置三方共用的域类型
+tooling/        工具层协议与治理：Tool 声明、注册表、Policy Gate、执行器、审计记录
+tools/          具体工具实现（第一批 8 个：7 读 + 1 低风险写）
+assistant/      Agent Runtime：AgentPlan 解析、提示词与限额、支持等级收紧、编排
 feishu/         飞书渠道：长连接、用户白名单、幂等、回复发送与审计落库
 notification/   通知渠道抽象（V0.1 只有飞书）
 storage/        SQLite 打开、迁移与各表读写
 ulid/           事件 ID 生成与解析
 config/         环境变量解析（密钥只从环境读取）
 ```
+
+分层与依赖方向：`tooling`（协议与治理）与 `identity`（身份）是 domain，
+不依赖任何其它内部包；`tools`（application）只依赖它们与 storage 的窄接口；
+`storage` / `api` / `feishu` 是 infrastructure，负责把存储、HTTP 与渠道接上。
+所有依赖显式注入（构造参数），没有任何包级全局状态。
 
 ## API
 
@@ -33,22 +41,57 @@ GET  /api/v1/task-summaries?date=...|project=...     Bearer device token，Agent
 GET  /api/v1/summaries/daily?date=YYYY-MM-DD       Bearer device token
 POST /api/v1/summaries/daily/generate?date=...     Bearer admin token
 GET  /api/v1/healthz                               无鉴权，只返回非敏感状态
+POST /api/v1/ask                                   Bearer admin token，只读调试问答
+GET  /api/v1/tools                                 Bearer admin token，工具目录与治理元信息
+GET  /api/v1/tool-audits?limit=N                   Bearer admin token，最近的工具调用审计
 ```
 
 默认每天 22:30 把聚合后的 Session Context 发送给 DeepSeek API，一天一次，结果通过飞书发送。飞书只响应配置的允许用户。模型或飞书失败不影响事件与 Session。
 
 ## 问答：AI-first Agent Runtime
 
-问答的默认入口是模型计划，不是正则：用户消息 + Profile + 有限对话状态 + 能力目录
-→ 模型生成 AgentPlan（严格 JSON Schema）→ Policy Gate 审批（工具白名单、参数 schema、
-只读、单轮调用数上限）→ 执行只读能力 → 事实回交模型合成回答 → 代码校验来源与支持等级。
+问答的默认入口是模型计划，不是正则：用户消息 + 身份 + 有限对话状态 + 工具目录
+→ 模型生成 AgentPlan（严格 JSON Schema）→ 工具执行器（策略闸门：工具白名单、
+参数 schema、风险级别、单轮调用数上限）→ 执行工具 → 事实回交模型合成回答
+→ 代码校验来源与支持等级。
 
 因此同一意图的各种自然语言说法都能生效，加一种说法不需要改 Go 代码。
 模型不可用时只对最明确的数据请求做确定性兜底（`assistant.MinimalFallback`），
-它不是第二套关键词机器人。
+它同样走工具执行器，因此照样过策略、照样留审计。
 
-`DeniedToolCalls`、`ConversationState`、`MemoryCandidate` 见
+## 工具层
+
+每个工具是一个声明式对象：名称、中文说明、严格参数 schema、结果 schema、
+风险级别、执行器。注册表构造期校验声明（写错就让启动失败），
+闸门只认注册表里的名字，执行器统一负责：
+
+- **先读后写**：写工具的来源必须来自本轮真实读到的记录，顺序由代码决定；
+- **证据注入**：模型给不出 `source_ids`（schema 里没有这个参数），
+  它只能由执行器从读到的记录里注入；
+- **审计**：每次调用（放行/拒绝/失败）写一条 `tool_audits`，参数裁剪到 64 字、
+  结果内容不落库；审计失败不影响回答。
+
+结果结构按"给谁看"划分：`Model`（脱敏视图，进提示词）与
+`Digest`（确定性事实行，降级时直接发给用户）之外，`Evidence` / `Count` / `Span`
+只用于代码判断与审计，从不进入模型上下文。
+
+### 第一批工具
+
+| 工具 | 风险 | 说明 |
+| --- | --- | --- |
+| `get_current_time` | 只读 | 当前时间与时段（模型不该自己算日期） |
+| `get_assistant_profile` | 只读 | 助手身份配置 |
+| `get_conversation_state` | 只读 | 有限的跨轮上下文 |
+| `get_today_status` | 只读 | 今天的活动摘要 |
+| `get_sessions` | 只读 | 按日期或项目查工作时段 |
+| `get_known_projects` | 只读 | 最近出现过的项目名 |
+| `get_task_summaries` | 只读 | Agent 汇报的任务摘要（唯一带结论的数据源） |
+| `save_memory_candidate` | 低风险写入 | 保存候选记忆；必须带来源，不自动晋升 |
+
+刻意**没有**任何 SQL、Shell、文件系统或网络工具。
+`ConversationState`、`MemoryCandidate` 见
 [`internal/storage/conversations.go`](internal/storage/conversations.go)；
+审计存储见 [`internal/storage/tool_audits.go`](internal/storage/tool_audits.go)；
 身份配置见 `config.Config.Profile()`。
 
 ### 任务摘要（agent.task_summary）
@@ -66,7 +109,8 @@ GET  /api/v1/healthz                               无鉴权，只返回非敏�
 不是传了会被过滤。`privacy_mode` 固定为 `metadata_only`。
 
 V0.1 不实现 Memory 确认入口、Episode、Reflection、Initiative Engine、command、向量检索或管理后台。
-记忆候选会写入 `memory_candidates`（状态恒为 candidate），未经用户确认不进入上下文。
+记忆候选只能通过 `save_memory_candidate` 写入 `memory_candidates`（状态恒为 candidate），
+必须带本轮读到的来源证据，未经用户确认不进入上下文，也不会出现在后续轮次的提示词里。
 
 ## Session 切断规则
 

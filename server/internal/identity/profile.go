@@ -1,17 +1,13 @@
-// Package assistant 实现 AI-first 的 Agent Runtime 第一条真实链路。
+// Package identity 是助手身份这一领域概念的唯一落点。
 //
-// 与旧实现的根本区别：旧路径是「正则判意图 → Go switch → 固定业务分支 →
-// 模型只做后置润色」。这里默认路径是：
+// 它是独立的域类型（而不是塞在 assistant 包里），因为身份同时被三方使用：
+//   - 提示词组装（assistant）：把身份渲染成给模型看的事实块；
+//   - get_assistant_profile 工具（tools）：把身份作为可调用的数据源返回；
+//   - 配置（config）：从环境变量构造身份。
 //
-//	用户消息 + Profile + 对话状态 + Capability 目录
-//	  → 模型生成 AgentPlan（严格 JSON Schema）
-//	  → 代码只做 Policy Gate（工具白名单、参数校验、预算、超时、敏感内容）
-//	  → 执行受限 Capability（只读，不碰 SQL/Shell）
-//	  → 结果回交模型合成 Answer（标记 supported/inferred/insufficient/conflicted）
-//	  → 代码校验来源、支持等级与敏感字段
-//
-// 代码不再决定"用户这句话是什么意思"，只负责"模型想做的事允不允许做"。
-package assistant
+// 三方都依赖它，而它不依赖任何一方——这样"换个部署环境只改配置就能换名字、
+// 换语言、换语气"这件事，不会被任何一层的实现细节绑死。
+package identity
 
 import (
 	"fmt"
@@ -20,8 +16,7 @@ import (
 
 // Profile 是助手的可配置身份。
 //
-// 所有用户可见的身份/语气都从这里读取，任何地方都不允许硬编码助手名字：
-// 换个部署环境应该只改配置就能让助手自称别的名字、说别的语言、用别的语气。
+// 所有用户可见的身份/语气都从这里读取，任何地方都不允许硬编码助手名字。
 type Profile struct {
 	// Name 是助手自称的名字（默认产品名 Lumen）。
 	Name string
@@ -37,8 +32,8 @@ type Profile struct {
 	Proactivity string
 }
 
-// DefaultProfile 返回默认身份。名字默认是产品名，但调用方可以整体替换。
-func DefaultProfile() Profile {
+// Default 返回默认身份。名字默认是产品名，但调用方可以整体替换。
+func Default() Profile {
 	return Profile{
 		Name:             "Lumen",
 		Role:             "个人助手/伙伴",
@@ -51,7 +46,7 @@ func DefaultProfile() Profile {
 
 // Normalize 补齐空字段并在非法值上回退，保证下游拿到的 Profile 一定可用。
 func (p Profile) Normalize() Profile {
-	d := DefaultProfile()
+	d := Default()
 	if strings.TrimSpace(p.Name) == "" {
 		p.Name = d.Name
 	}
@@ -79,13 +74,10 @@ func (p Profile) Normalize() Profile {
 
 // AddressLine 返回助手如何称呼用户；没配置称呼时返回空串。
 func (p Profile) AddressLine() string {
-	if p.OwnerDisplayName == "" {
-		return ""
-	}
 	return p.OwnerDisplayName
 }
 
-// PromptBlock 把 Profile 渲染成给模型看的事实块。
+// PromptBlock 把身份渲染成给模型看的事实块。
 //
 // 这是"身份由配置驱动"的落点：模型看到的身份描述来自这里，
 // 而不是写死在系统提示里的「你叫 Lumen」。
@@ -102,22 +94,4 @@ func (p Profile) PromptBlock() string {
 	fmt.Fprintf(&b, "- 语气：%s\n", p.Tone)
 	fmt.Fprintf(&b, "- 主动性：%s\n", p.Proactivity)
 	return b.String()
-}
-
-// ProfileResult 是 get_assistant_profile 能力的返回结果。
-type ProfileResult struct {
-	Name             string `json:"name"`
-	Role             string `json:"role"`
-	OwnerDisplayName string `json:"owner_display_name,omitempty"`
-	Language         string `json:"language"`
-	Tone             string `json:"tone"`
-	Proactivity      string `json:"proactivity"`
-}
-
-// AsResult 把 Profile 转成能力返回结构。
-func (p Profile) AsResult() ProfileResult {
-	return ProfileResult{
-		Name: p.Name, Role: p.Role, OwnerDisplayName: p.OwnerDisplayName,
-		Language: p.Language, Tone: p.Tone, Proactivity: p.Proactivity,
-	}
 }

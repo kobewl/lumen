@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"lumen/server/internal/ai"
+	"lumen/server/internal/tooling"
 )
 
 // 计划模式。代码只认这几种，其余一律拒绝。
@@ -20,7 +21,7 @@ const (
 	ModeSignoff = "signoff"
 )
 
-// 允许的时间范围取值。空串表示未指定。
+// allowedTimeRanges 是时间范围白名单。空串表示未指定。
 var allowedTimeRanges = map[string]bool{
 	"":             true,
 	"today":        true,
@@ -31,7 +32,7 @@ var allowedTimeRanges = map[string]bool{
 }
 
 // Understanding 是模型对这句话的理解。它只是**计划的一部分**，
-// 不是事实：证据仍然来自 Capability 的返回，不来自这里。
+// 不是事实：证据仍然来自工具的返回，不来自这里。
 type Understanding struct {
 	Goal      string   `json:"goal"`
 	Entities  []string `json:"entities"`
@@ -41,34 +42,28 @@ type Understanding struct {
 	Confidence float64 `json:"confidence"`
 }
 
-// ToolCall 是模型请求调用的一次能力。
+// 计划的 JSON 形状。
 //
-// 参数用 map[string]any 接收，但会被 Policy Gate 按能力自身的 schema 逐项校验，
-// 未声明的参数一律拒绝——模型不能靠构造参数绕过限制。
-type ToolCall struct {
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
+// 工具调用直接复用 tooling.Call：模型输出与策略输入是同一个形状，
+// 中间不需要再转一层（转换层是"参数在某处被悄悄改写"的常见来源）。
+// Plan 自身则用自定义 UnmarshalJSON 做严格解析，因此这里只作用于模型输出。
+type planDoc struct {
+	Mode                  string         `json:"mode"`
+	Understanding         Understanding  `json:"understanding"`
+	ToolCalls             []tooling.Call `json:"tool_calls"`
+	NeedsClarification    bool           `json:"needs_clarification"`
+	ClarificationQuestion string         `json:"clarification_question"`
+	ResponseStyle         string         `json:"response_style"`
 }
 
-// MemoryCandidate 是模型提议记录的一条候选记忆。
-//
-// 它**不会**直接成为记忆：只以 candidate 状态落库，等用户确认后才可能晋升。
-type MemoryCandidate struct {
-	Kind       string   `json:"kind"`
-	Content    string   `json:"content"`
-	SourceIDs  []string `json:"source_ids"`
-	Confidence float64  `json:"confidence"`
-}
-
-// Plan 是模型产出的 AgentPlan，对应一段严格 JSON。
+// Plan 是模型产出的 AgentPlan。
 type Plan struct {
-	Mode                  string            `json:"mode"`
-	Understanding         Understanding     `json:"understanding"`
-	ToolCalls             []ToolCall        `json:"tool_calls"`
-	NeedsClarification    bool              `json:"needs_clarification"`
-	ClarificationQuestion string            `json:"clarification_question"`
-	MemoryCandidates      []MemoryCandidate `json:"memory_candidates"`
-	ResponseStyle         string            `json:"response_style"`
+	Mode                  string
+	Understanding         Understanding
+	ToolCalls             []tooling.Call
+	NeedsClarification    bool
+	ClarificationQuestion string
+	ResponseStyle         string
 }
 
 // PlanParseError 表示模型输出无法作为合法计划使用。
@@ -97,7 +92,7 @@ type planEnvelope struct {
 //
 // 校验分两层：
 //  1. 结构层（这里）：JSON 合法性、未知字段拒绝、模式与时间范围白名单；
-//  2. 策略层（policy.go）：工具白名单、参数 schema、敏感内容、数量上限。
+//  2. 策略层（tooling.PolicyGate）：工具白名单、参数 schema、数量上限。
 //
 // 结构层只保证"这是一份能读懂的计划"，不判断"该不该执行"。
 func ParsePlan(content string) (Plan, error) {
@@ -114,13 +109,22 @@ func ParsePlan(content string) (Plan, error) {
 		return Plan{}, planError("plan 字段为空")
 	}
 
-	var p Plan
+	var doc planDoc
 	dec := json.NewDecoder(strings.NewReader(string(env.Plan)))
 	// 拒绝未知字段：模型臆造的新字段必须显式失败，而不是被静默忽略后
 	// 让代码以为计划里没有这一步。
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&p); err != nil {
+	if err := dec.Decode(&doc); err != nil {
 		return Plan{}, planError("plan 字段结构不符: %v", err)
+	}
+
+	p := Plan{
+		Mode:                  doc.Mode,
+		Understanding:         doc.Understanding,
+		ToolCalls:             doc.ToolCalls,
+		NeedsClarification:    doc.NeedsClarification,
+		ClarificationQuestion: doc.ClarificationQuestion,
+		ResponseStyle:         doc.ResponseStyle,
 	}
 
 	switch p.Mode {
@@ -145,12 +149,12 @@ func ParsePlan(content string) (Plan, error) {
 	// 计划自洽性：recall 模式没有工具调用就没有数据可依据，说明这份计划
 	// 是残缺的。这种情况不猜测补齐，直接判为不可用并走安全降级。
 	if p.Mode == ModeRecall && len(p.ToolCalls) == 0 {
-		return Plan{}, planError("recall 模式必须至少调用一个数据能力")
+		return Plan{}, planError("recall 模式必须至少调用一个工具")
 	}
 	return p, nil
 }
 
-// ToolNames 返回计划里请求调用的能力名，用于日志与审计（不含参数）。
+// ToolNames 返回计划里请求调用的工具名，用于日志与审计（不含参数）。
 func (p Plan) ToolNames() []string {
 	out := make([]string, 0, len(p.ToolCalls))
 	for _, c := range p.ToolCalls {

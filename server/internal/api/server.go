@@ -28,6 +28,8 @@ import (
 	"lumen/server/internal/config"
 	"lumen/server/internal/events"
 	"lumen/server/internal/feishu"
+	"lumen/server/internal/initiative"
+	"lumen/server/internal/profile"
 	"lumen/server/internal/sessions"
 	"lumen/server/internal/storage"
 	"lumen/server/internal/summary"
@@ -51,7 +53,17 @@ type Server struct {
 	summary *summary.Service
 	qa      *feishu.QAService
 	logger  *slog.Logger
+	// initiative 是主动关怀服务（可选；nil 时对应端点返回未启用）。
+	initiative *initiative.Service
+	// profile 是记忆生命周期服务（可选；nil 时对应端点返回未启用）。
+	profile *profile.Service
 }
+
+// SetInitiative 注册主动关怀服务（装配根显式注入；nil 表示未启用）。
+func (s *Server) SetInitiative(svc *initiative.Service) { s.initiative = svc }
+
+// SetProfileService 注册记忆生命周期服务（装配根显式注入；nil 表示未启用）。
+func (s *Server) SetProfileService(svc *profile.Service) { s.profile = svc }
 
 // NewServer 创建 HTTP 服务。
 // qaService 用于只读调试接口 /api/v1/ask；可以为 nil（该接口将返回未启用）。
@@ -78,6 +90,20 @@ func (s *Server) Handler() http.Handler {
 	// 只读调试接口：用与飞书问答相同的逻辑处理一句话，便于在不打开飞书的情况下
 	// 验证问答链路与排查问题。需要管理令牌。
 	mux.HandleFunc("/api/v1/ask", s.handleAsk)
+	// 工具层的两个只读调试接口：模型能选什么工具、每轮实际调了什么。
+	// 都需要管理令牌，且只返回元信息（不含用户数据内容）。
+	mux.HandleFunc("/api/v1/tools", s.handleTools)
+	mux.HandleFunc("/api/v1/tool-audits", s.handleToolAudits)
+	// 主动关怀：手工触发一次判定（本地验收/dry-run 用）与出站账本查询。
+	// 真实投递由配置开关与渠道可用性守门，端点只暴露同一套 RunOnce。
+	mux.HandleFunc("/api/v1/initiative/run", s.handleInitiativeRun)
+	mux.HandleFunc("/api/v1/initiative/outbox", s.handleInitiativeOutbox)
+	// 记忆生命周期：候选列表、确认、拒绝与已确认信息视图。
+	// 全部管理令牌保护；确认是"记忆生效"的唯一入口。
+	mux.HandleFunc("/api/v1/memory/candidates", s.handleMemoryCandidates)
+	mux.HandleFunc("/api/v1/memory/confirm", s.handleMemoryConfirm)
+	mux.HandleFunc("/api/v1/memory/reject", s.handleMemoryReject)
+	mux.HandleFunc("/api/v1/profile", s.handleProfile)
 	return s.withRecovery(s.withLogging(mux))
 }
 
@@ -562,13 +588,7 @@ func (s *Server) handleRebuildSessions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 POST")
 		return
 	}
-	if s.cfg.AdminToken == "" {
-		writeError(w, http.StatusForbidden, "admin_disabled", "管理接口未开启")
-		return
-	}
-	if subtleCompare(bearerToken(r), s.cfg.AdminToken) != 1 {
-		_ = s.store.RecordSecurityEvent(r.Context(), "admin_rejected", "管理令牌无效", "")
-		writeError(w, http.StatusUnauthorized, "unauthorized", "管理令牌无效")
+	if !s.requireAdmin(w, r, "重算 Session") {
 		return
 	}
 
@@ -691,14 +711,7 @@ func (s *Server) handleGenerateSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 管理鉴权：只有持有 admin token 的调用者才能花钱触发模型。
-	if s.cfg.AdminToken == "" {
-		writeError(w, http.StatusForbidden, "admin_disabled", "管理接口未开启")
-		return
-	}
-	token := bearerToken(r)
-	if subtleCompare(token, s.cfg.AdminToken) != 1 {
-		_ = s.store.RecordSecurityEvent(r.Context(), "admin_rejected", "管理令牌无效", "")
-		writeError(w, http.StatusUnauthorized, "unauthorized", "管理令牌无效")
+	if !s.requireAdmin(w, r, "手工生成总结") {
 		return
 	}
 
@@ -743,13 +756,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 POST")
 		return
 	}
-	if s.cfg.AdminToken == "" {
-		writeError(w, http.StatusForbidden, "admin_disabled", "管理接口未开启")
-		return
-	}
-	if subtleCompare(bearerToken(r), s.cfg.AdminToken) != 1 {
-		_ = s.store.RecordSecurityEvent(r.Context(), "admin_rejected", "管理令牌无效", "")
-		writeError(w, http.StatusUnauthorized, "unauthorized", "管理令牌无效")
+	if !s.requireAdmin(w, r, "只读问答调试") {
 		return
 	}
 	if s.qa == nil {
@@ -777,20 +784,443 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"question":           req.Text,
-		"mode":               reply.Mode,
-		"status":             reply.Status,
-		"support_level":      reply.SupportLevel,
-		"used_ai":            reply.UsedAI,
-		"answer":             reply.Text,
-		"tool_calls":         reply.ToolCalls,
-		"denied_tools":       reply.DeniedTools,
-		"source_session_ids": reply.SourceSessionIDs,
-		// 任务摘要的来源单独一组：两类来源的可信度不同，合在一起就分不清
-		// 回答里哪些是 Agent 报告的结论、哪些是从活动记录推断的。
+		"question":      req.Text,
+		"mode":          reply.Mode,
+		"status":        reply.Status,
+		"support_level": reply.SupportLevel,
+		"used_ai":       reply.UsedAI,
+		"answer":        reply.Text,
+		"tool_calls":    reply.ToolCalls,
+		"denied_tools":  reply.DeniedTools,
+		// 两类来源分开返回：可信度不同，合在一起就分不清回答里哪些是
+		// Agent 报告的结论、哪些是从活动记录推断的。
 		// 只用于追溯（管理令牌 + 只读），不进用户可见文本。
-		"source_task_ids": reply.SourceTaskIDs,
+		"source_session_ids": reply.SourceSessionIDs,
+		"source_task_ids":    reply.SourceTaskIDs,
+		"memory_candidates":  reply.MemoryCandidates,
+		// 上下文装配的截断/降级元信息：回答"这轮模型看到的上下文缺了什么"，
+		// 只进调试接口，不进用户可见文本。
+		"context_truncations": nonNilList(reply.Truncations),
 	})
+}
+
+// ---- 工具层只读接口 ----
+
+// handleTools 返回当前注册的工具目录与每个工具的治理信息。
+//
+// 存在的意义：回答"这个助手到底能做什么"。模型只能从这份目录里选工具，
+// 因此目录本身就是能力边界；把它暴露出来（管理令牌保护）让运维与验收
+// 不必读代码就能确认边界，也给"模型是不是在请求目录外的工具"提供对照。
+func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 GET")
+		return
+	}
+	if !s.requireAdmin(w, r, "查看工具目录") {
+		return
+	}
+	if s.qa == nil {
+		writeError(w, http.StatusServiceUnavailable, "qa_disabled", "问答服务未启用")
+		return
+	}
+
+	registry := s.qa.Agent().ToolRegistry()
+	if registry == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"count": 0, "tools": []any{}})
+		return
+	}
+
+	out := make([]map[string]any, 0, registry.Len())
+	for _, spec := range registry.Specs() {
+		params := make([]map[string]any, 0, len(spec.Parameters))
+		for _, p := range spec.Parameters {
+			item := map[string]any{
+				"name":        p.Name,
+				"type":        string(p.Type),
+				"required":    p.Required,
+				"description": p.Description,
+			}
+			if len(p.Enum) > 0 {
+				item["enum"] = p.Enum
+			}
+			if p.HasRange {
+				item["min"] = p.Min
+				item["max"] = p.Max
+			}
+			params = append(params, item)
+		}
+		out = append(out, map[string]any{
+			"name":              spec.Name,
+			"summary":           spec.Summary,
+			"risk":              string(spec.Risk),
+			"risk_label":        spec.Risk.Label(),
+			"kind":              string(spec.Kind),
+			"parameters":        params,
+			"result_schema":     spec.ResultSchema,
+			"requires_evidence": spec.RequiresEvidence,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":   len(out),
+		"tools":   out,
+		"catalog": registry.Catalog(),
+	})
+}
+
+// handleToolAudits 返回最近的工具调用审计。
+//
+// 只返回元信息：工具名、风险级别、决策、原因、耗时、结果条数与证据条数。
+// 参数值只保留前 64 字（写入时就已裁剪），结果内容一律不记——
+// 审计要回答"发生了什么"，不是"用户的数据长什么样"。
+func (s *Server) handleToolAudits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 GET")
+		return
+	}
+	if !s.requireAdmin(w, r, "查看工具审计") {
+		return
+	}
+
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	records, err := s.store.RecentToolAudits(ctx, limit)
+	if err != nil {
+		s.logger.Error("查询工具审计失败", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "查询失败")
+		return
+	}
+	out := make([]map[string]any, 0, len(records))
+	for _, rec := range records {
+		out = append(out, map[string]any{
+			"id":          rec.ID,
+			"at":          storage.FormatISO(rec.At),
+			"actor":       rec.Actor,
+			"tool":        rec.Tool,
+			"risk":        rec.Risk,
+			"args":        rec.Args,
+			"decision":    rec.Decision,
+			"reason":      rec.Reason,
+			"duration_ms": rec.DurationMS,
+			"result_kind": rec.ResultKind,
+			"item_count":  rec.ItemCount,
+			"evidence_n":  rec.EvidenceN,
+			"truncated":   rec.Truncated,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "audits": out})
+}
+
+// requireAdmin 校验管理令牌；失败时已写好响应，调用方直接 return。
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request, action string) bool {
+	if s.cfg.AdminToken == "" {
+		writeError(w, http.StatusForbidden, "admin_disabled", "管理接口未开启")
+		return false
+	}
+	if subtleCompare(bearerToken(r), s.cfg.AdminToken) != 1 {
+		_ = s.store.RecordSecurityEvent(r.Context(), "admin_rejected", action+"：管理令牌无效", "")
+		writeError(w, http.StatusUnauthorized, "unauthorized", "管理令牌无效")
+		return false
+	}
+	return true
+}
+
+// ---- 主动关怀 ----
+
+// handleInitiativeRun 手工触发一次主动关怀判定。
+//
+// force=true 仅供本地验收跳过频率限制（仍写 outbox 审计）；
+// 是否真的发送由配置开关、dry-run 与渠道可用性决定，端点不提供"强制发送"。
+func (s *Server) handleInitiativeRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 POST")
+		return
+	}
+	if !s.requireAdmin(w, r, "触发主动关怀") {
+		return
+	}
+	if s.initiative == nil {
+		writeError(w, http.StatusServiceUnavailable, "initiative_disabled", "主动关怀未启用")
+		return
+	}
+	force := strings.EqualFold(r.URL.Query().Get("force"), "true")
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	out, err := s.initiative.RunOnce(ctx, force)
+	if err != nil {
+		s.logger.Error("主动关怀执行失败", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "执行失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"action":     out.Action,
+		"reason":     out.Reason,
+		"text":       out.Text,
+		"outbox_ids": nonNilList(out.OutboxIDs),
+		"forced":     force,
+	})
+}
+
+// handleInitiativeOutbox 返回最近的主动关怀出站记录（审计）。
+func (s *Server) handleInitiativeOutbox(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 GET")
+		return
+	}
+	if !s.requireAdmin(w, r, "查看主动关怀出站账本") {
+		return
+	}
+
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	records, err := s.store.RecentInitiativeOutbox(ctx, limit)
+	if err != nil {
+		s.logger.Error("查询出站记录失败", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "查询失败")
+		return
+	}
+	out := make([]map[string]any, 0, len(records))
+	for _, rec := range records {
+		item := map[string]any{
+			"id":          rec.ID,
+			"user_id":     rec.UserID,
+			"local_date":  rec.LocalDate,
+			"created_at":  storage.FormatISO(rec.CreatedAt),
+			"status":      rec.Status,
+			"skip_reason": rec.SkipReason,
+			"text":        rec.Text,
+			"basis":       nonNilList(rec.Basis),
+			"evidence":    nonNilList(rec.Evidence),
+			"channel":     rec.Channel,
+		}
+		if !rec.Delivered.IsZero() {
+			item["delivered_at"] = storage.FormatISO(rec.Delivered)
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "outbox": out})
+}
+
+// ---- 记忆生命周期 ----
+
+// handleMemoryCandidates 列出候选记忆（管理接口）。
+//
+// status=candidate|confirmed|rejected|all（默认 candidate）；limit 默认 50。
+func (s *Server) handleMemoryCandidates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 GET")
+		return
+	}
+	if !s.requireAdmin(w, r, "查看记忆候选") {
+		return
+	}
+
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+	list, err := s.store.MemoryCandidatesByStatus(r.Context(),
+		r.URL.Query().Get("status"), limit)
+	if err != nil {
+		s.logger.Error("查询记忆候选失败", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "查询失败")
+		return
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, c := range list {
+		item := map[string]any{
+			"id":            c.ID,
+			"user_id":       c.UserID,
+			"kind":          c.Kind,
+			"key":           c.Key,
+			"content":       c.Content,
+			"source_ids":    nonNilList(c.SourceIDs),
+			"confidence":    c.Confidence,
+			"status":        c.Status,
+			"created_at":    storage.FormatISO(c.CreatedAt),
+			"decided_by":    c.DecidedBy,
+			"reject_reason": c.RejectReason,
+		}
+		if !c.DecidedAt.IsZero() {
+			item["decided_at"] = storage.FormatISO(c.DecidedAt)
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "candidates": out})
+}
+
+// handleMemoryConfirm 确认一条候选（记忆生效的唯一入口）。
+//
+// 幂等：重复确认返回 already_confirmed；拒绝的候选不能再确认（409）；
+// 敏感内容拒绝确认并给出原因（409）；都不扩散候选正文到日志。
+func (s *Server) handleMemoryConfirm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 POST")
+		return
+	}
+	if !s.requireAdmin(w, r, "确认记忆候选") {
+		return
+	}
+	if s.profile == nil {
+		writeError(w, http.StatusServiceUnavailable, "profile_disabled", "记忆生命周期未启用")
+		return
+	}
+	var req struct {
+		CandidateID string `json:"candidate_id"`
+	}
+	if err := decodeJSON(r, &req, 4*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "需要 candidate_id")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	res, err := s.profile.Confirm(ctx, req.CandidateID, "admin")
+	if err != nil {
+		s.writeProfileError(w, r, "确认记忆候选", err)
+		return
+	}
+	out := map[string]any{
+		"candidate_id": res.CandidateID,
+		"status":       res.Status,
+		"note":         res.Note,
+	}
+	if res.Key != "" {
+		out["key"] = res.Key
+		out["version"] = res.Version
+		out["replaced"] = res.Replaced
+		if res.PreviousValue != "" {
+			out["previous_value"] = res.PreviousValue
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleMemoryReject 拒绝一条候选。拒绝的候选不产生任何 Profile 投影。
+func (s *Server) handleMemoryReject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 POST")
+		return
+	}
+	if !s.requireAdmin(w, r, "拒绝记忆候选") {
+		return
+	}
+	if s.profile == nil {
+		writeError(w, http.StatusServiceUnavailable, "profile_disabled", "记忆生命周期未启用")
+		return
+	}
+	var req struct {
+		CandidateID string `json:"candidate_id"`
+		Reason      string `json:"reason"`
+	}
+	if err := decodeJSON(r, &req, 4*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "需要 candidate_id")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	res, err := s.profile.Reject(ctx, req.CandidateID, "admin", req.Reason)
+	if err != nil {
+		s.writeProfileError(w, r, "拒绝记忆候选", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"candidate_id": res.CandidateID,
+		"status":       res.Status,
+		"note":         res.Note,
+	})
+}
+
+// handleProfile 返回已确认 UserProfile（当前值 + 近期变更历史）。
+func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "只支持 GET")
+		return
+	}
+	if !s.requireAdmin(w, r, "查看已确认信息") {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	entries, err := s.store.ProfileEntries(ctx, r.URL.Query().Get("user_id"))
+	if err != nil {
+		s.logger.Error("查询已确认信息失败", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "查询失败")
+		return
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, map[string]any{
+			"key":                 e.Key,
+			"kind":                e.Kind,
+			"value":               e.Value,
+			"version":             e.Version,
+			"source_candidate_id": e.SourceCandidateID,
+			"source_ids":          nonNilList(e.SourceIDs),
+			"updated_at":          storage.FormatISO(e.UpdatedAt),
+		})
+	}
+	history, err := s.store.ProfileHistory(ctx, r.URL.Query().Get("user_id"), "", 20)
+	if err != nil {
+		s.logger.Warn("查询确认历史失败", "error", err.Error())
+	}
+	historyOut := make([]map[string]any, 0, len(history))
+	for _, h := range history {
+		historyOut = append(historyOut, map[string]any{
+			"key":            h.Key,
+			"version":        h.Version,
+			"action":         h.Action,
+			"candidate_id":   h.CandidateID,
+			"value":          h.Value,
+			"previous_value": h.PreviousValue,
+			"operator":       h.Operator,
+			"created_at":     storage.FormatISO(h.CreatedAt),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":   len(out),
+		"entries": out,
+		"history": historyOut,
+	})
+}
+
+// writeProfileError 把生命周期服务的语义化错误映射成 HTTP 状态码。
+// 404=不存在；409=状态机拒绝（已拒绝/已确认/敏感内容）；其余按 500。
+func (s *Server) writeProfileError(w http.ResponseWriter, r *http.Request, action string, err error) {
+	switch {
+	case errors.Is(err, profile.ErrNotFound):
+		writeError(w, http.StatusNotFound, "candidate_not_found", "候选记忆不存在")
+	case errors.Is(err, profile.ErrRejected), errors.Is(err, profile.ErrConfirmed),
+		errors.Is(err, profile.ErrSensitive):
+		writeError(w, http.StatusConflict, "lifecycle_conflict", err.Error())
+	default:
+		s.logger.Error(action+"失败", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "操作失败")
+	}
 }
 
 // ---- 辅助 ----

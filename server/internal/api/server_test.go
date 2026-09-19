@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,10 +19,15 @@ import (
 	"lumen/server/internal/auth"
 	"lumen/server/internal/config"
 	"lumen/server/internal/events"
+	"lumen/server/internal/feishu"
+	"lumen/server/internal/initiative"
 	"lumen/server/internal/notification"
 	"lumen/server/internal/sessions"
 	"lumen/server/internal/storage"
 	"lumen/server/internal/summary"
+	"lumen/server/internal/temporal"
+	"lumen/server/internal/tooling"
+	"lumen/server/internal/tools"
 	"lumen/server/internal/ulid"
 )
 
@@ -41,6 +47,7 @@ var testLoc = func() *time.Location {
 
 type testEnv struct {
 	handler   http.Handler
+	srv       *Server
 	store     *storage.Store
 	cfg       *config.Config
 	deviceID  string
@@ -108,7 +115,8 @@ func newTestEnv(t *testing.T, aiResponder func(w http.ResponseWriter, r *http.Re
 	summaryService := summary.NewService(store, engine, aiClient, sender, testLoc,
 		cfg.SummaryDailyLimit, nil, logger)
 	env.summary = summaryService
-	env.handler = NewServer(cfg, store, authService, engine, summaryService, nil, logger).Handler()
+	env.srv = NewServer(cfg, store, authService, engine, summaryService, nil, logger)
+	env.handler = env.srv.Handler()
 	return env
 }
 
@@ -842,5 +850,381 @@ func TestRebuildSessionsEndpoint(t *testing.T) {
 	}
 	if rec := env.do(t, http.MethodPost, "/api/v1/sessions/rebuild", nil, testAdminToken); rec.Code != http.StatusBadRequest {
 		t.Fatalf("缺少参数应返回 400，实际 %d", rec.Code)
+	}
+}
+
+// ---- 工具层只读接口 ----
+
+// newToolEnv 搭一个带工具问答服务的测试服务端（无外部模型）。
+func newToolEnv(t *testing.T) *testEnv {
+	t.Helper()
+	env := newTestEnv(t, nil)
+	cfg := env.cfg
+	svc := feishu.NewQAService(feishu.QAServiceOptions{
+		Store:           env.store,
+		Loc:             testLoc,
+		Profile:         cfg.Profile(),
+		QueryDailyLimit: cfg.QueryDailyLimit,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Audit:           storage.ToolAuditSink{Store: env.store},
+	})
+	authService := auth.NewService(env.store, cfg.EnrollmentToken, 1)
+	env.handler = NewServer(cfg, env.store, authService, sessions.NewEngine(env.store, testLoc),
+		env.summary, svc, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	return env
+}
+
+// TestToolsEndpointRequiresAdmin 覆盖工具目录接口的鉴权。
+func TestToolsEndpointRequiresAdmin(t *testing.T) {
+	env := newToolEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/api/v1/tools", nil, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("缺少令牌应返回 401，实际 %d", rec.Code)
+	}
+	env.register(t)
+	rec = env.do(t, http.MethodGet, "/api/v1/tools", nil, env.devToken)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("设备令牌不能看工具目录，实际 %d", rec.Code)
+	}
+}
+
+// TestToolsEndpointReturnsGovernanceMetadata 覆盖工具目录的内容。
+//
+// 这条接口的意义是"不读代码就能确认能力边界"：每个工具必须带上
+// 风险级别、参数 schema、结果 schema 与是否需要来源证据。
+func TestToolsEndpointReturnsGovernanceMetadata(t *testing.T) {
+	env := newToolEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/api/v1/tools", nil, testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("查询失败: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Count int `json:"count"`
+		Tools []struct {
+			Name             string           `json:"name"`
+			Summary          string           `json:"summary"`
+			Risk             string           `json:"risk"`
+			RiskLabel        string           `json:"risk_label"`
+			Kind             string           `json:"kind"`
+			RequiresEvidence bool             `json:"requires_evidence"`
+			Parameters       []map[string]any `json:"parameters"`
+			ResultSchema     string           `json:"result_schema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if resp.Count != 8 {
+		t.Fatalf("应返回 8 个工具，实际 %d", resp.Count)
+	}
+
+	byName := map[string]int{}
+	for i, tool := range resp.Tools {
+		byName[tool.Name] = i
+		if tool.Summary == "" || tool.ResultSchema == "" || tool.RiskLabel == "" {
+			t.Fatalf("工具 %s 缺少治理元信息: %+v", tool.Name, tool)
+		}
+	}
+
+	// 唯一的写工具必须标成低风险写入并要求来源证据。
+	memIdx, ok := byName["save_memory_candidate"]
+	if !ok {
+		t.Fatal("工具目录应包含 save_memory_candidate")
+	}
+	mem := resp.Tools[memIdx]
+	if mem.Risk != "write_low" || !mem.RequiresEvidence {
+		t.Fatalf("写工具应是低风险且要求来源，实际 %+v", mem)
+	}
+	// 它不能接受 source_ids 参数：来源只能由代码注入。
+	for _, p := range mem.Parameters {
+		if p["name"] == "source_ids" {
+			t.Fatal("写工具不应接受 source_ids 参数：来源必须由代码注入")
+		}
+	}
+	// 只读工具不应要求来源。
+	if idx, ok := byName["get_today_status"]; ok {
+		if resp.Tools[idx].RequiresEvidence {
+			t.Fatal("只读工具不应要求来源证据")
+		}
+	}
+}
+
+// TestToolAuditsEndpointReturnsRecords 覆盖审计接口。
+func TestToolAuditsEndpointReturnsRecords(t *testing.T) {
+	env := newToolEnv(t)
+
+	// 手工写两条审计：放行与拒绝各一条。
+	sink := storage.ToolAuditSink{Store: env.store}
+	ctx := context.Background()
+	if err := sink.Record(ctx, tooling.AuditRecord{
+		Actor: "u1", Tool: "get_today_status", Risk: tooling.RiskRead,
+		Args: map[string]any{"date": "2026-09-18"}, Decision: tooling.DecisionAllowed,
+		ResultKind: tooling.KindActivity, Count: 2, EvidenceN: 2, DurationMS: 3,
+	}); err != nil {
+		t.Fatalf("写入审计失败: %v", err)
+	}
+	if err := sink.Record(ctx, tooling.AuditRecord{
+		Actor: "u1", Tool: "run_sql", Decision: tooling.DecisionDenied,
+		Reason: "未知工具", DurationMS: 0,
+	}); err != nil {
+		t.Fatalf("写入审计失败: %v", err)
+	}
+
+	// 鉴权。
+	if rec := env.do(t, http.MethodGet, "/api/v1/tool-audits", nil, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("缺少令牌应返回 401，实际 %d", rec.Code)
+	}
+
+	rec := env.do(t, http.MethodGet, "/api/v1/tool-audits", nil, testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("查询失败: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Count  int `json:"count"`
+		Audits []struct {
+			Tool       string         `json:"tool"`
+			Decision   string         `json:"decision"`
+			Reason     string         `json:"reason"`
+			Actor      string         `json:"actor"`
+			Args       map[string]any `json:"args"`
+			ResultKind string         `json:"result_kind"`
+			ItemCount  int            `json:"item_count"`
+			EvidenceN  int            `json:"evidence_n"`
+		} `json:"audits"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if resp.Count != 2 {
+		t.Fatalf("应返回 2 条审计，实际 %d", resp.Count)
+	}
+	// 最新的在前：拒绝的那条应当是第一条。
+	if resp.Audits[0].Tool != "run_sql" || resp.Audits[0].Decision != tooling.DecisionDenied {
+		t.Fatalf("应按时间倒序返回，实际 %+v", resp.Audits[0])
+	}
+	if resp.Audits[0].Reason == "" {
+		t.Fatal("拒绝记录必须带原因")
+	}
+	if resp.Audits[1].Actor != "u1" || resp.Audits[1].ItemCount != 2 || resp.Audits[1].EvidenceN != 2 {
+		t.Fatalf("放行记录内容不符: %+v", resp.Audits[1])
+	}
+}
+
+// TestToolAuditsEndpointCapsArgumentLength 覆盖"审计里的参数被裁短"这条端到端保证。
+//
+// 审计要长期保存，不能因为某个参数很长就把大段用户内容写进去。
+// 断言链路是完整的：执行器裁剪 → 存储落库 → 接口返回。
+func TestToolAuditsEndpointCapsArgumentLength(t *testing.T) {
+	store, err := storage.Open(context.Background(), filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	registry, err := tooling.NewRegistry(auditProbeTool{})
+	if err != nil {
+		t.Fatalf("构造注册表失败: %v", err)
+	}
+	exec, err := tooling.NewExecutor(tooling.ExecutorOptions{
+		Registry: registry, Audit: storage.ToolAuditSink{Store: store},
+	})
+	if err != nil {
+		t.Fatalf("构造执行器失败: %v", err)
+	}
+
+	long := strings.Repeat("项", 200)
+	info := tooling.RunInfo{Actor: "u1",
+		Temporal: temporal.Build(temporal.FixedClock(time.Date(2026, 9, 18, 13, 19, 0, 0, time.UTC)), testLoc)}
+	if _, denied := exec.Run(context.Background(), []tooling.Call{{
+		Name: "get_sessions", Arguments: map[string]any{"project": long},
+	}}, info); len(denied) != 0 {
+		t.Fatalf("调用应被放行，实际 %+v", denied)
+	}
+
+	records, err := store.RecentToolAudits(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("读取审计失败: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("应有 1 条审计，实际 %d", len(records))
+	}
+	got, _ := records[0].Args["project"].(string)
+	if len([]rune(got)) > 70 {
+		t.Fatalf("审计里的参数应被裁短到 64 字左右，实际 %d 字", len([]rune(got)))
+	}
+	if !strings.Contains(got, "…") {
+		t.Fatalf("裁短处应显式标注，实际 %q", got)
+	}
+}
+
+// auditProbeTool 是只用于审计测试的最小工具。
+type auditProbeTool struct{}
+
+func (auditProbeTool) Spec() tooling.Spec {
+	return tooling.Spec{
+		Name: "get_sessions", Summary: "测试用只读工具",
+		ResultSchema: `{"sessions":[]}`, Kind: tooling.KindActivity, Risk: tooling.RiskRead,
+		Parameters: []tooling.Param{
+			{Name: "project", Type: tooling.ParamString, MaxLength: 200, Description: "项目名"},
+		},
+	}
+}
+
+func (auditProbeTool) Execute(context.Context, tooling.Invocation) (tooling.Result, error) {
+	return tooling.Result{Count: 0}, nil
+}
+
+// ---- 主动关怀端点 ----
+
+// fakeInitiativePlanner 是 API 集成测试用的假提案模型（initiative.Planner）。
+type fakeInitiativePlanner struct {
+	proposal initiative.Proposal
+	err      error
+}
+
+func (f *fakeInitiativePlanner) Propose(context.Context, initiative.ProposalRequest) (initiative.Proposal, error) {
+	if f.err != nil {
+		return initiative.Proposal{}, f.err
+	}
+	return f.proposal, nil
+}
+
+// newInitiativeEnv 搭一个启用主动关怀（dry-run）的测试服务端，并灌入今天的记录。
+func newInitiativeEnv(t *testing.T, planner initiative.Planner) *testEnv {
+	t.Helper()
+	env := newTestEnv(t, nil)
+
+	// 种子：今天一段工作 + 一条 Agent 任务摘要（保证有可依据的事实）。
+	now := time.Now().In(testLoc)
+	date := now.Format("2006-01-02")
+	apps, _ := json.Marshal([]map[string]any{{"app": "ZCode", "duration_minutes": 90}})
+	stats, _ := json.Marshal(map[string]any{"duration_minutes": 90})
+	start := now.Add(-2 * time.Hour)
+	sess := storage.Session{
+		ID: "s_api_init", Date: date, Project: "lumen", StartAt: start,
+		EndAt: start.Add(90 * time.Minute), AppsJSON: string(apps), StatsJSON: string(stats),
+		AlgorithmVersion: "rules-v2", SourceStartAt: start, SourceEndAt: start.Add(24 * time.Hour),
+		UpdatedAt: time.Now().UTC(),
+	}
+	from := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, testLoc).UTC()
+	if err := env.store.ReplaceSessions(context.Background(), date, from, from.Add(24*time.Hour),
+		[]storage.Session{sess}); err != nil {
+		t.Fatalf("写入 Session 失败: %v", err)
+	}
+	if _, err := env.store.UpsertTaskSummary(context.Background(), storage.TaskSummary{
+		ID: "evt-1", DeviceID: "dev-1", TaskID: "t_api_init", Project: "lumen",
+		Title: "接通主动关怀", Status: "done", SourceAgent: "zcode-cli",
+		OccurredAt: now.Add(-time.Hour), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("写入任务摘要失败: %v", err)
+	}
+
+	registry, err := tooling.NewRegistry(tools.All(tools.Options{
+		Store: env.store, Profile: env.cfg.Profile(), Location: testLoc,
+	})...)
+	if err != nil {
+		t.Fatalf("构造注册表失败: %v", err)
+	}
+	executor, err := tooling.NewExecutor(tooling.ExecutorOptions{Registry: registry})
+	if err != nil {
+		t.Fatalf("构造执行器失败: %v", err)
+	}
+	policy := initiative.DefaultPolicy()
+	policy.Enabled = true
+	svc := initiative.New(initiative.Options{
+		Store: env.store, Executor: executor, Planner: planner, Profile: env.cfg.Profile(),
+		Loc: testLoc, Targets: []string{"ou_api_target"}, DryRun: true, Policy: policy,
+	})
+	env.srv.SetInitiative(svc)
+	return env
+}
+
+// TestInitiativeRunEndpointDryRun 覆盖验收 P1-5 的端点层：
+// dry-run 走完整链路，写 outbox，但不真实发送。
+func TestInitiativeRunEndpointDryRun(t *testing.T) {
+	planner := &fakeInitiativePlanner{proposal: initiative.Proposal{
+		Question: "上午在 lumen 上花了不少时间，进展还顺利吗？",
+		Basis:    []string{"t_api_init", "get_today_status"},
+	}}
+	env := newInitiativeEnv(t, planner)
+
+	// 鉴权。
+	if rec := env.do(t, http.MethodPost, "/api/v1/initiative/run", nil, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("缺少令牌应返回 401，实际 %d", rec.Code)
+	}
+
+	rec := env.do(t, http.MethodPost, "/api/v1/initiative/run", nil, testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("触发失败: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Action    string   `json:"action"`
+		Reason    string   `json:"reason"`
+		Text      string   `json:"text"`
+		OutboxIDs []string `json:"outbox_ids"`
+		Forced    bool     `json:"forced"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if resp.Action != "dry_run" {
+		t.Fatalf("默认应为 dry_run（默认不真实发送），实际 %s (%s)", resp.Action, resp.Reason)
+	}
+	if len(resp.OutboxIDs) != 1 || resp.Text == "" {
+		t.Fatalf("应写 outbox 并带问题全文，实际 %+v", resp)
+	}
+
+	// outbox 查询端点可见，状态 dry_run，依据可追溯。
+	rec = env.do(t, http.MethodGet, "/api/v1/initiative/outbox", nil, testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("查询失败: %d", rec.Code)
+	}
+	var list struct {
+		Count  int `json:"count"`
+		Outbox []struct {
+			Status   string   `json:"status"`
+			Text     string   `json:"text"`
+			Basis    []string `json:"basis"`
+			Evidence []string `json:"evidence"`
+		} `json:"outbox"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if list.Count != 1 || list.Outbox[0].Status != "dry_run" {
+		t.Fatalf("应返回 1 条 dry_run 记录，实际 %+v", list)
+	}
+	if len(list.Outbox[0].Basis) != 2 {
+		t.Fatalf("依据应落库，实际 %v", list.Outbox[0].Basis)
+	}
+
+	// 频率：第二次不带 force 应被间隔拦住（dry_run 也计入）。
+	rec = env.do(t, http.MethodPost, "/api/v1/initiative/run", nil, testAdminToken)
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Action != "skipped" || !strings.Contains(resp.Reason, "间隔") {
+		t.Fatalf("第二次应因间隔跳过，实际 %s (%s)", resp.Action, resp.Reason)
+	}
+
+	// force 跳过频率限制（本地验收用），仍写审计。
+	rec = env.do(t, http.MethodPost, "/api/v1/initiative/run?force=true", nil, testAdminToken)
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Action != "dry_run" || !resp.Forced {
+		t.Fatalf("force 应放行，实际 %s (%s)", resp.Action, resp.Reason)
+	}
+}
+
+// TestInitiativeDisabledEndpoint 覆盖开关关闭时端点诚实返回。
+func TestInitiativeDisabledEndpoint(t *testing.T) {
+	env := newTestEnv(t, nil)
+	// 未调用 SetInitiative：服务未启用。
+	rec := env.do(t, http.MethodPost, "/api/v1/initiative/run", nil, testAdminToken)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("未启用应返回 503，实际 %d", rec.Code)
+	}
+	rec = env.do(t, http.MethodGet, "/api/v1/initiative/outbox", nil, testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("账本查询仍应可用（空列表），实际 %d", rec.Code)
 	}
 }

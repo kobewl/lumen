@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"lumen/server/internal/assistant"
+	"lumen/server/internal/identity"
 )
 
 // Config 是 lumen-server 的完整运行时配置。
@@ -73,6 +73,26 @@ type Config struct {
 	MaxEventBytes      int64
 	MaxBatchEvents     int
 	ClockSkewTolerance time.Duration
+
+	// 主动关怀（Initiative）
+	//
+	// 两道开关默认都朝"不发"的方向：Enabled 默认 false（功能整体关闭），
+	// DryRun 默认 true（即使启用也只写 outbox 不真发）。
+	// 真实发送需要同时显式配置 Enabled=true 且 DryRun=false。
+	InitiativeEnabled bool
+	InitiativeDryRun  bool
+
+	// 上下文装配预算（Context Assembler）。
+	//
+	// 0 表示用代码里的默认值（DefaultBudget）。只开放整包上限与近期轮次
+	// 两个旋钮：段级上限属于产品口径，改它们应该改代码并过测试。
+	ContextBudgetTotal int
+	ContextRecentTurns int
+
+	// DevFakeClock 是本地验收用的固定时钟（RFC3339，如 2026-09-18T13:19:00+08:00）。
+	// 留空即真实时间。名字带 Dev：它会让"今天/现在"整体冻结，
+	// 只应该出现在本地验收环境；设了它启动日志会大声警告。
+	DevFakeClock string
 }
 
 // Load 从环境变量解析配置。
@@ -139,6 +159,23 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	c.InitiativeEnabled = strings.EqualFold(strings.TrimSpace(os.Getenv("LUMEN_INITIATIVE_ENABLED")), "true")
+	// DryRun 默认 true：只有显式设为 false 才真实发送（fail-safe）。
+	c.InitiativeDryRun = !strings.EqualFold(strings.TrimSpace(os.Getenv("LUMEN_INITIATIVE_DRY_RUN")), "false")
+	c.DevFakeClock = strings.TrimSpace(os.Getenv("LUMEN_DEV_FAKE_CLOCK"))
+	if c.DevFakeClock != "" {
+		if _, err := time.Parse(time.RFC3339, c.DevFakeClock); err != nil {
+			return nil, fmt.Errorf("LUMEN_DEV_FAKE_CLOCK 必须是 RFC3339 时间（如 2026-09-18T13:19:00+08:00）: %v", err)
+		}
+	}
+
+	if c.ContextBudgetTotal, err = envInt("LUMEN_CONTEXT_BUDGET_TOTAL", 0); err != nil {
+		return nil, err
+	}
+	if c.ContextRecentTurns, err = envInt("LUMEN_CONTEXT_RECENT_TURNS", 0); err != nil {
+		return nil, err
+	}
+
 	c.FeishuAllowedUserIDs = splitIDs(os.Getenv("LUMEN_FEISHU_ALLOWED_USER_IDS"))
 	c.FeishuPairingMode = strings.EqualFold(strings.TrimSpace(os.Getenv("LUMEN_FEISHU_PAIRING_MODE")), "true")
 	// 配对模式下即使白名单为空也要启动机器人，否则拿不到 open_id。
@@ -170,13 +207,13 @@ func (c *Config) Location() *time.Location {
 //
 // 总结时间被拼进「主动性」描述：这是模型判断"几点会收到总结"的唯一来源。
 // 之前这个时间写死在「我下班了」的固定回复里，改配置就会骗人。
-func (c *Config) Profile() assistant.Profile {
+func (c *Config) Profile() identity.Profile {
 	proactive := c.AssistantProactive
 	if c.SummaryHour >= 0 && c.SummaryHour <= 23 && c.SummaryMinute >= 0 && c.SummaryMinute <= 59 {
 		proactive = fmt.Sprintf("%s；每天 %02d:%02d 会用当天的完整记录主动发一份总结"+
 			"（在此之前不要替用户提前生成总结）", proactive, c.SummaryHour, c.SummaryMinute)
 	}
-	return assistant.Profile{
+	return identity.Profile{
 		Name:             c.AssistantName,
 		Role:             c.AssistantRole,
 		OwnerDisplayName: c.OwnerDisplayName,
@@ -210,6 +247,11 @@ func (c *Config) Redacted() map[string]any {
 		"summary_at":       fmt.Sprintf("%02d:%02d", c.SummaryHour, c.SummaryMinute),
 		"assistant_name":   c.AssistantName,
 		"assistant_role":   c.AssistantRole,
+		"initiative":       c.InitiativeEnabled,
+		"initiative_dry":   c.InitiativeDryRun,
+		"dev_fake_clock":   c.DevFakeClock != "",
+		"ctx_budget_total": c.ContextBudgetTotal,
+		"ctx_recent_turns": c.ContextRecentTurns,
 	}
 }
 

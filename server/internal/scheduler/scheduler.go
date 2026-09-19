@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"lumen/server/internal/initiative"
 	"lumen/server/internal/storage"
 	"lumen/server/internal/summary"
 )
@@ -28,6 +29,8 @@ type Scheduler struct {
 	backupDir     string
 	backupKeep    int
 	logger        *slog.Logger
+	// initiative 是主动关怀服务（可选；nil = 未启用，不启动该任务）。
+	initiative *initiative.Service
 }
 
 // New 创建调度器。
@@ -46,10 +49,48 @@ func New(store *storage.Store, summaryService *summary.Service, loc *time.Locati
 	}
 }
 
+// WithInitiative 注册主动关怀服务（链式，供装配根显式注入）。
+//
+// 频率与静默由 initiative.Policy 在服务内部守门；调度器只负责每 30 分钟
+// 唤醒一次——被策略跳过时它不调模型、不写 outbox，代价可以忽略。
+func (s *Scheduler) WithInitiative(svc *initiative.Service) *Scheduler {
+	s.initiative = svc
+	return s
+}
+
 // Run 阻塞运行所有定时任务，直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
 	go s.runSummaryJob(ctx)
 	go s.runMaintenanceJob(ctx)
+	if s.initiative != nil {
+		go s.runInitiativeJob(ctx)
+	}
+}
+
+// runInitiativeJob 每 30 分钟询问一次"要不要主动说一句话"。
+//
+// 判定（静默/频率/间隔）在服务内部完成，这里只负责唤醒与记录结果。
+func (s *Scheduler) runInitiativeJob(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			out, err := s.initiative.RunOnce(runCtx, false)
+			cancel()
+			if err != nil {
+				s.logger.Warn("主动关怀执行失败", "error", err.Error())
+				continue
+			}
+			if out.Action != "disabled" && out.Action != "skipped" {
+				s.logger.Info("主动关怀触发", "action", out.Action, "reason", out.Reason)
+			}
+		}
+	}
 }
 
 // runSummaryJob 每分钟检查一次是否到达每日总结时间。

@@ -58,6 +58,15 @@ fi
 mkdir -p "$WORK_DIR/data"
 info "工作目录: $WORK_DIR"
 
+# 端口被上一次没退干净的进程占用时，服务端会静默起不来（日志级别是 warn，
+# 启动失败信息落在 stderr 而健康检查只会说"未就绪"）。这里先检查并明确报出来。
+if lsof -nP -iTCP:"$SERVER_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    fail "端口 $SERVER_PORT 已被占用（可能是上次没退干净的 lumen-server）"
+    lsof -nP -iTCP:"$SERVER_PORT" -sTCP:LISTEN | tail -n +2
+    echo "  先执行: pkill -f lumen-server"
+    exit 1
+fi
+
 cd "$ROOT_DIR/server"
 go build -o "$WORK_DIR/lumen-server" ./cmd/lumen-server
 pass "服务端编译完成"
@@ -108,8 +117,21 @@ def summary_reply(user):
     }, ensure_ascii=False)
 
 
+def user_text(user):
+    """只取 <user_message> 里的内容，而不是整段 Planner 输入。
+
+    Planner 的输入里还有我们回填的对话状态（"上一轮提到的项目：…"）。
+    直接对整段文本判断，会把我们自己写进去的说明误当成用户的话。
+    """
+    found = re.search(r"<user_message>(.*?)</user_message>", user, re.S)
+    if not found:
+        return user.strip()
+    return found.group(1).strip()
+
+
 def plan_reply(user, scenario_day):
     """按用户原话生成计划——模拟真实模型的语义判断，不是关键词查表。"""
+    user = user_text(user)
     # 越权场景：模拟模型试图读整库。这不是关键词机器人，而是
     # "如果模型真的提出了越权请求，系统会不会拦住"的验证。
     if "所有记录" in user:
@@ -123,7 +145,6 @@ def plan_reply(user, scenario_day):
             ],
             "needs_clarification": False,
             "clarification_question": "",
-            "memory_candidates": [],
             "response_style": "简短",
         }}, ensure_ascii=False)
     # 身份类问题：必须先调 get_assistant_profile 拿真实身份。
@@ -135,7 +156,6 @@ def plan_reply(user, scenario_day):
             "tool_calls": [{"name": "get_assistant_profile", "arguments": {}}],
             "needs_clarification": False,
             "clarification_question": "",
-            "memory_candidates": [],
             "response_style": "简短自报身份",
         }}, ensure_ascii=False)
     # 问"完成了什么/结果/没做完"→ 任务摘要。这是唯一带结论的数据源。
@@ -148,8 +168,40 @@ def plan_reply(user, scenario_day):
                             "arguments": {"date": scenario_day}}],
             "needs_clarification": False,
             "clarification_question": "",
-            "memory_candidates": [],
             "response_style": "先列 Agent 报告的结论",
+        }}, ensure_ascii=False)
+    # 已确认信息问答：答案只来自 trusted_context 里用户确认过的偏好，
+    # 不需要调用工具（演示"确认后下一轮可见"，由 Lumen 侧保证注入）。
+    if re.search(r"怎么称呼|叫我什么|我的称呼|你叫我", user):
+        return json.dumps({"plan": {
+            "mode": "chat",
+            "understanding": {"goal": "用户想知道已确认的称呼", "entities": [],
+                              "time_range": "", "confidence": 0.9},
+            "tool_calls": [],
+            "needs_clarification": False,
+            "clarification_question": "",
+            "response_style": "按已确认信息回答",
+        }}, ensure_ascii=False)
+    # 记忆类：用户要求记住一条偏好。preference 挂本轮用户消息来源；
+    # Lumen 要求 preference 必须给出稳定槽位 key（纠正时同槽位替换）。
+    if re.search(r"记住|记一下|帮我记|以后都", user):
+        slot = "称呼" if re.search(r"叫我|怎么称呼|称呼", user) else "回答风格"
+        return json.dumps({"plan": {
+            "mode": "recall",
+            "understanding": {"goal": "用户希望记住一条偏好", "entities": [],
+                              "time_range": "today", "confidence": 0.85},
+            "tool_calls": [
+                {"name": "get_sessions", "arguments": {"date": scenario_day}},
+                {"name": "save_memory_candidate", "arguments": {
+                    "kind": "preference",
+                    "key": slot,
+                    "content": "用户希望我记住：" + re.sub(r"[，。！？\s]", "", user)[:60],
+                    "confidence": 0.8,
+                }},
+            ],
+            "needs_clarification": False,
+            "clarification_question": "",
+            "response_style": "确认记下（但要说明只是候选）",
         }}, ensure_ascii=False)
     # 其它情况当成"想看记录"：这正是不该用正则判语义的地方。
     return json.dumps({"plan": {
@@ -159,13 +211,26 @@ def plan_reply(user, scenario_day):
         "tool_calls": [{"name": "get_sessions", "arguments": {"date": scenario_day}}],
         "needs_clarification": False,
         "clarification_question": "",
-        "memory_candidates": [],
         "response_style": "列应用与时长",
     }}, ensure_ascii=False)
 
 
 def synth_reply(user):
     """合成阶段：只能依据事实回答，因此这里从事实里取值而不是写死文案。"""
+    # 已确认信息问答：只依据 trusted_context 里代码注入的"已确认信息"段。
+    # 段不存在就诚实说没有——候选记忆绝不会被注入，因此确认前只能答"没有"。
+    um = re.search(r"<user_message>(.*?)</user_message>", user, re.S)
+    question = um.group(1) if um else user
+    if re.search(r"怎么称呼|叫我什么|我的称呼|你叫我", question):
+        m = re.search(r"- 称呼：(.+?)（第 (\d+) 版）", user)
+        if m:
+            return json.dumps({"answer": f"按你确认过的偏好，{m.group(1)}（第 {m.group(2)} 版）。",
+                               "support_level": "supported"}, ensure_ascii=False)
+        return json.dumps({"answer": "我这边还没有你确认过的称呼记录。",
+                           "support_level": "insufficient"}, ensure_ascii=False)
+    if '"saved":true' in user.replace(" ", ""):
+        return json.dumps({"answer": "记下了（候选，还没生效），以后我先说结论。",
+                           "support_level": "supported"}, ensure_ascii=False)
     if '"name":"' in user:
         name = re.search(r'"name":"([^"]+)"', user).group(1)
         return json.dumps({"answer": f"我是{name}，你的联调助手。",
@@ -199,6 +264,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if "tool_calls" in system:
             content = plan_reply(user, sys.argv[3])
+        elif '"skip"' in system and '"basis"' in system:
+            # 主动关怀提案：依据 facts 里真实出现的 task_id。
+            # basis 允许两种写法：task_id（模型可见）或事实来源的工具名。
+            # 时段的内部 ID 刻意不进模型上下文，模型不引用它。
+            ids = re.findall(r'"task_id"\s*:\s*"([^"]+)"', user)
+            if ids:
+                basis = ids[:2]
+            elif '"sessions":[{"' in user.replace(" ", ""):
+                basis = ["get_today_status"]
+            else:
+                basis = []
+            if basis:
+                content = json.dumps({
+                    "skip": False, "reason": "用户在推进项目",
+                    "question": "最近在项目上投入了不少，进展还顺利吗？",
+                    "basis": basis,
+                }, ensure_ascii=False)
+            else:
+                content = json.dumps({"skip": True, "reason": "没有可依据的记录",
+                                      "question": "", "basis": []}, ensure_ascii=False)
         elif "support_level" in system:
             content = synth_reply(user)
         else:
@@ -255,16 +340,28 @@ LUMEN_DEEPSEEK_API_KEY="sk-mock-for-e2e" \
 LUMEN_DEEPSEEK_MODEL="deepseek-chat" \
 LUMEN_ASSISTANT_NAME="小灯" \
 LUMEN_ASSISTANT_ROLE="联调助手" \
+LUMEN_INITIATIVE_ENABLED="true" \
+LUMEN_INITIATIVE_DRY_RUN="true" \
+LUMEN_FEISHU_ALLOWED_USER_IDS="ou_e2e_care" \
 LUMEN_LOG_LEVEL="warn" \
 "$WORK_DIR/lumen-server" > "$WORK_DIR/server.log" 2>&1 &
 SERVER_PID=$!
-sleep 2
 
-HEALTH="$(curl -sf "http://127.0.0.1:$SERVER_PORT/api/v1/healthz")" || {
+# 就绪等待用轮询而不是固定 sleep：全新编译的二进制首次执行要过 macOS
+# 的签名扫描，偶发超过 2 秒，单次探测会把"慢"误判成"起不来"。
+SERVER_READY=""
+for _ in $(seq 1 40); do
+    if HEALTH="$(curl -sf -m 2 "http://127.0.0.1:$SERVER_PORT/api/v1/healthz" 2>/dev/null)"; then
+        SERVER_READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [ -z "$SERVER_READY" ]; then
     fail "服务端未就绪"
     cat "$WORK_DIR/server.log"
     exit 1
-}
+fi
 pass "服务端已启动，version=$(echo "$HEALTH" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
 
 # ---- 1. 注册与鉴权 ----
@@ -975,17 +1072,28 @@ for line in open(sys.argv[1], encoding="utf-8"):
     body = json.loads(line)
     system = body["messages"][0]["content"]
     if "tool_calls" in system:
-        planner_prompts.append(system)
+        planner_prompts.append(body)
 
 if not planner_prompts:
     print("  ❌ 未捕获到 Planner 提示词")
     sys.exit(1)
-system = planner_prompts[0]
-if "小灯" in system and "联调助手" in system:
-    print("  ✅ Planner 提示词注入了配置的身份")
+# 身份现在由上下文装配器注入 trusted_context（用户侧消息），系统提示只留规则。
+body0 = planner_prompts[0]
+system = body0["messages"][0]["content"]
+user_prompt = body0["messages"][-1]["content"]
+if "小灯" in user_prompt and "联调助手" in user_prompt and "trusted_context" in user_prompt:
+    print("  ✅ Planner 提示词在 trusted_context 中注入了配置的身份")
 else:
-    print("  ❌ Planner 提示词应包含配置的名字与定位")
+    print("  ❌ Planner 提示词应在 trusted_context 中包含配置的名字与定位")
     failed = 1
+if "- 你的名字是" in system:
+    # 工具目录的 result_schema 里会出现配置名（get_assistant_profile），
+    # 那是数据源声明而不是身份注入；身份块（"- 你的名字是：…"）只应
+    # 出现在 trusted_context，不再拼进系统提示。
+    print("  ❌ 系统提示不应再拼身份块（身份统一走 trusted_context）")
+    failed = 1
+else:
+    print("  ✅ 系统提示不再拼身份块（身份统一走 trusted_context）")
 if "你是 Lumen" in system:
     print("  ❌ Planner 提示词不应写死 Lumen")
     failed = 1
@@ -1063,6 +1171,459 @@ if "全部记录" in d.get("answer", "") or "所有记录" in d.get("answer", ""
 sys.exit(failed)
 PYEOF
 
+
+# ---- 8.5 工具层：目录、审计、低风险写入 ----
+
+section "8.5 工具层（目录 / 审计 / 低风险写入）"
+
+# 工具目录：模型只能从这份目录里选，因此它就是能力边界。
+TOOLS_JSON="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/tools" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+echo "$TOOLS_JSON" > "$WORK_DIR/tools.json"
+python3 - "$WORK_DIR/tools.json" <<'PYEOF' || FAILED=1
+import json, sys
+
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = 0
+if d.get("count") == 8:
+    print("  ✅ 工具目录返回 8 个工具")
+else:
+    print(f"  ❌ 应有 8 个工具，实际 {d.get('count')}")
+    failed = 1
+
+tools = {t["name"]: t for t in d.get("tools") or []}
+for want in ("get_current_time", "get_assistant_profile", "get_conversation_state",
+             "get_today_status", "get_sessions", "get_known_projects",
+             "get_task_summaries", "save_memory_candidate"):
+    if want not in tools:
+        print(f"  ❌ 目录缺少工具 {want}")
+        failed = 1
+if not failed:
+    print("  ✅ 八个工具齐全")
+
+# 只有一个是写入工具，且必须是低风险 + 必须带来源证据。
+writes = [t for t in tools.values() if t["risk"] != "read"]
+if len(writes) == 1 and writes[0]["risk"] == "write_low" and writes[0]["requires_evidence"]:
+    print("  ✅ 唯一的写工具是低风险写入且要求来源证据")
+else:
+    print(f"  ❌ 写工具的治理属性不符: {writes}")
+    failed = 1
+
+# 写工具不能接受 source_ids：来源只能由代码注入。
+mem = tools.get("save_memory_candidate", {})
+if any(p.get("name") == "source_ids" for p in mem.get("parameters") or []):
+    print("  ❌ 写工具不应接受 source_ids 参数（来源必须由代码注入）")
+    failed = 1
+else:
+    print("  ✅ 写工具不接受 source_ids（来源由代码注入）")
+
+# 每个工具都要有中文说明与结果 schema。
+for name, tool in tools.items():
+    if not tool.get("summary") or not tool.get("result_schema"):
+        print(f"  ❌ 工具 {name} 缺少说明或结果 schema")
+        failed = 1
+sys.exit(failed)
+PYEOF
+
+# 记忆写入：只写候选、必须带来源、不得自动晋升。
+ask "以后都先给我说结论，记住这点" > "$WORK_DIR/ask_memory.json"
+
+python3 - "$WORK_DIR/ask_memory.json" "$WORK_DIR/data/lumen.db" <<'PYEOF' || FAILED=1
+import json, sqlite3, sys
+
+reply = json.load(open(sys.argv[1], encoding="utf-8"))
+db = sqlite3.connect(sys.argv[2])
+failed = 0
+
+if "save_memory_candidate" in (reply.get("tool_calls") or []):
+    print("  ✅ 模型选择了 save_memory_candidate")
+else:
+    print(f"  ❌ 应调用写工具，实际 {reply.get('tool_calls')}")
+    failed = 1
+
+if not reply.get("denied_tools"):
+    print("  ✅ 写调用没有被拒绝")
+else:
+    print(f"  ❌ 写调用不应被拒，实际 {reply['denied_tools']}")
+    failed = 1
+
+rows = db.execute("SELECT kind, status, source_ids FROM memory_candidates").fetchall()
+if len(rows) != 1:
+    print(f"  ❌ 应写入 1 条候选记忆，实际 {len(rows)} 条")
+    failed = 1
+else:
+    kind, status, source_ids = rows[0]
+    if status == "candidate":
+        print("  ✅ 只写候选状态（candidate），未自动生效")
+    else:
+        print(f"  ❌ 状态应为 candidate，实际 {status}")
+        failed = 1
+    if not json.loads(source_ids):
+        print("  ❌ 候选记忆必须带可核实的来源")
+        failed = 1
+    else:
+        print(f"  ✅ 来源由代码注入（{len(json.loads(source_ids))} 个）")
+
+# 已确认记忆必须仍为空：没有确认入口就绝不晋升。
+confirmed = db.execute(
+    "SELECT COUNT(*) FROM memory_candidates WHERE status = 'confirmed'").fetchone()[0]
+if confirmed == 0:
+    print("  ✅ 候选未自动晋升为已确认记忆")
+else:
+    print(f"  ❌ 候选不应自动晋升，实际 {confirmed} 条已确认")
+    failed = 1
+db.close()
+sys.exit(failed)
+PYEOF
+
+# 候选记忆不得进入后续轮次的模型上下文。
+ask "你好" > /dev/null
+if grep -q "先看结论" "$WORK_DIR/deepseek_requests.jsonl"; then
+    # 只有当前这轮请求里出现是允许的（用户原话），此后不应再出现候选内容。
+    AFTER_MEMORY="$(awk '/save_memory_candidate/{found=1} found' "$WORK_DIR/deepseek_requests.jsonl" | grep -c "先看结论" || true)"
+    if [ "$AFTER_MEMORY" -le 1 ]; then
+        pass "候选记忆未进入后续轮次的模型上下文"
+    else
+        fail "候选记忆内容出现在后续模型请求里（$AFTER_MEMORY 次）"
+    fi
+else
+    pass "候选记忆未进入模型请求"
+fi
+
+# 审计：每次工具调用都必须留痕，包括被拒的调用。
+AUDITS="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/tool-audits?limit=200" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+echo "$AUDITS" > "$WORK_DIR/audits.json"
+python3 - "$WORK_DIR/audits.json" <<'PYEOF' || FAILED=1
+import json, sys
+
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+audits = d.get("audits") or []
+failed = 0
+
+if not audits:
+    print("  ❌ 审计表为空：工具调用必须留下记录")
+    sys.exit(1)
+print(f"  ✅ 审计记录了 {len(audits)} 次工具调用")
+
+decisions = {a["decision"] for a in audits}
+if "allowed" in decisions:
+    print("  ✅ 放行的调用已记录")
+else:
+    print("  ❌ 缺少放行记录")
+    failed = 1
+if "denied" in decisions:
+    print("  ✅ 被拒的调用也记录了（越权尝试可追溯）")
+else:
+    print("  ❌ 缺少拒绝记录：越权尝试必须可追溯")
+    failed = 1
+
+# 拒绝记录必须带原因。
+for a in audits:
+    if a["decision"] in ("denied", "error") and not a.get("reason"):
+        print(f"  ❌ 拒绝/失败记录缺少原因: {a}")
+        failed = 1
+
+# 审计只记元信息：不应包含用户可见文本或内部 ID。
+blob = json.dumps(audits, ensure_ascii=False)
+for bad in ("sess-e2e-hidden", "unclassified"):
+    if bad in blob:
+        print(f"  ❌ 审计不应包含 {bad}")
+        failed = 1
+
+# 证据条数必须记录（否则"审计"无法回答"这次调用了什么依据"）。
+with_evidence = [a for a in audits if a.get("evidence_n", 0) > 0]
+if with_evidence:
+    print(f"  ✅ 审计记录了证据条数（{len(with_evidence)} 条有来源）")
+else:
+    print("  ❌ 检索类调用应记录证据条数")
+    failed = 1
+
+# 参数值必须被裁短：审计要长期保存，不能堆积用户全文。
+for a in audits:
+    for value in (a.get("args") or {}).values():
+        if isinstance(value, str) and len(value) > 70:
+            print(f"  ❌ 审计里的参数未被裁短: {len(value)} 字")
+            failed = 1
+sys.exit(failed)
+PYEOF
+
+# 审计接口需要管理令牌。
+CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$SERVER_PORT/api/v1/tool-audits")"
+[ "$CODE" = "401" ] && pass "审计接口拒绝未授权访问 (401)" || fail "审计接口应返回 401，实际 $CODE"
+
+CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$SERVER_PORT/api/v1/tools")"
+[ "$CODE" = "401" ] && pass "工具目录拒绝未授权访问 (401)" || fail "工具目录应返回 401，实际 $CODE"
+
+# ---- 8.6 主动关怀（dry-run 本地闭环） ----
+
+section "8.6 主动关怀（dry-run）"
+
+# 未授权访问必须拒绝。
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    "http://127.0.0.1:$SERVER_PORT/api/v1/initiative/run")"
+[ "$CODE" = "401" ] && pass "关怀触发拒绝未授权访问 (401)" || fail "应返回 401，实际 $CODE"
+
+# 关怀要有依据：先补一条"今天"的活动记录（e2e 可能在 13 点前运行，
+# 主体种子数据落在场景日期=昨天）。批量上报会自动重算受影响日期。
+python3 - "$WORK_DIR" <<'PYEOF'
+import datetime as dt, json, os, sys, uuid
+
+work = sys.argv[1]
+ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+raw = uuid.uuid4().int
+ulid = "".join(ALPHABET[(raw >> (5 * i)) & 0x1F] for i in range(25, -1, -1))
+now = dt.datetime.now().astimezone().replace(microsecond=0)
+morning = now.replace(hour=9, minute=0, second=0)
+if morning > now:
+    morning = now - dt.timedelta(hours=1)
+event = {
+    "id": ulid, "device_id": "desktop-mac-01", "type": "window.activity",
+    "timestamp": morning.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "privacy": "P0",
+    "context": {"app": "ZCode", "project": "lumen"},
+    "data": {"duration_seconds": 3600},
+}
+with open(os.path.join(work, "care_event.json"), "w", encoding="utf-8") as fh:
+    json.dump({"device_id": "desktop-mac-01", "batch_id": ulid + "B",
+               "sent_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "events": [event]}, fh)
+PYEOF
+curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/events/batch" \
+    -H "Authorization: Bearer $DEVICE_TOKEN" -H 'Content-Type: application/json' \
+    --data-binary "@$WORK_DIR/care_event.json" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)["results"][0]
+assert r["status"] == "accepted", r
+print("  · 已补一条今天的活动记录（供关怀引用）")
+'
+
+# 首次触发用 force：e2e 可能在任意时刻运行（含静默时段），
+# force 只跳过频率限制，仍走完整链路并写 outbox。
+RUN="$(curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/initiative/run?force=true" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+echo "$RUN" > "$WORK_DIR/initiative_run.json"
+
+python3 - "$WORK_DIR/initiative_run.json" "$WORK_DIR/data/lumen.db" <<'PYEOF' || FAILED=1
+import json, sqlite3, sys
+
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = 0
+
+if d.get("action") == "dry_run":
+    print("  ✅ 默认 dry-run：走了完整链路但没有真实发送")
+else:
+    print(f"  ❌ 应为 dry_run，实际 {d.get('action')} ({d.get('reason')})")
+    failed = 1
+
+if d.get("text"):
+    print(f"  ✅ 生成了有依据的问题：{d['text'][:40]}…")
+else:
+    print("  ❌ 应生成问题全文")
+    failed = 1
+
+if not d.get("forced"):
+    print("  ❌ force 标记应回显")
+    failed = 1
+
+db = sqlite3.connect(sys.argv[2])
+rows = db.execute(
+    "SELECT status, text, basis_json, evidence_json FROM initiative_outbox").fetchall()
+if len(rows) != 1:
+    print(f"  ❌ outbox 应有 1 条，实际 {len(rows)} 条")
+    failed = 1
+else:
+    status, text, basis, evidence = rows[0]
+    if status != "dry_run":
+        print(f"  ❌ outbox 状态应为 dry_run，实际 {status}")
+        failed = 1
+    else:
+        print("  ✅ outbox 落了 dry_run 记录（草稿 + 审计二合一）")
+    if json.loads(basis):
+        print("  ✅ 依据（basis）落库且来自本轮核实的事实")
+    else:
+        print("  ❌ 问题必须带依据")
+        failed = 1
+    if json.loads(evidence):
+        print("  ✅ 本轮核实过的证据 ID 一并留档")
+    else:
+        print("  ❌ 证据 ID 应留档")
+        failed = 1
+db.close()
+sys.exit(failed)
+PYEOF
+
+# 第二次不带 force：应被频率策略拦住（间隔或静默，取决于运行时刻）。
+RUN2="$(curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/initiative/run" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+python3 - "$RUN2" <<'PYEOF' || FAILED=1
+import json, sys
+
+d = json.loads(sys.argv[1])
+if d.get("action") == "skipped" and d.get("reason"):
+    print(f"  ✅ 第二次触发被策略拦住（{d['reason']}），不重复打扰")
+else:
+    print(f"  ❌ 第二次应被跳过，实际 {d.get('action')} ({d.get('reason')})")
+    sys.exit(1)
+PYEOF
+
+# outbox 查询端点（管理令牌）。
+OUTBOX="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/initiative/outbox" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+python3 - "$OUTBOX" <<'PYEOF2' || { fail "outbox 查询端点应返回记录"; FAILED=1; }
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get("count", 0) >= 1:
+    print("  ✅ outbox 查询端点返回 %d 条记录" % d["count"])
+    sys.exit(0)
+print("  ❌ outbox 查询端点应返回记录")
+sys.exit(1)
+PYEOF2
+
+# ---- 8.7 记忆生命周期（候选 → 确认/拒绝 → 已确认信息注入） ----
+
+section "8.7 记忆生命周期（确认 / 拒绝 / 纠正 / 下一轮可见）"
+
+# 8.5 已保存一条"回答风格"偏好候选。确认前：Profile 视图必须为空（候选不泄漏），
+# 但候选列表端点可见（等管理确认）。
+PROFILE="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/profile?user_id=debug" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+python3 - "$PROFILE" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get("count") == 0 and not d.get("entries"):
+    print("  ✅ 确认前已确认信息为空（候选记忆不泄漏进上下文数据源）")
+else:
+    print(f"  ❌ 确认前 Profile 应为空，实际 {d}")
+    sys.exit(1)
+PYEOF
+
+# 无令牌访问必须 401。
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SERVER_PORT/api/v1/memory/candidates")
+if [ "$CODE" = "401" ]; then
+    echo "  ✅ 候选列表端点要求管理令牌（无令牌 401）"
+else
+    echo "  ❌ 候选列表端点无令牌应 401，实际 $CODE"
+    FAILED=1
+fi
+
+CAND_LIST="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/memory/candidates?status=candidate" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+CAND_ID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); rows=[c for c in d.get("candidates",[]) if c["status"]=="candidate" and c.get("key")=="回答风格"]; print(rows[0]["id"] if rows else "")' "$CAND_LIST")
+if [ -n "$CAND_ID" ]; then
+    echo "  ✅ 候选列表端点可见（含稳定槽位 key：回答风格）"
+else
+    echo "  ❌ 应能列出 8.5 保存的候选"
+    FAILED=1
+fi
+
+# 确认 → v1 生效；重复确认幂等。
+CONFIRM="$(curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/memory/confirm" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"candidate_id\": \"$CAND_ID\"}")"
+python3 - "$CONFIRM" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get("status") == "confirmed" and d.get("key") == "回答风格" and d.get("version") == 1:
+    print("  ✅ 确认生效：写入已确认信息（回答风格 v1）")
+else:
+    print(f"  ❌ 确认结果不符: {d}")
+    sys.exit(1)
+PYEOF
+
+AGAIN="$(curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/memory/confirm" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"candidate_id\": \"$CAND_ID\"}")"
+python3 - "$AGAIN" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get("status") == "already_confirmed":
+    print("  ✅ 重复确认幂等（already_confirmed，不产生新版本）")
+else:
+    print(f"  ❌ 重复确认应幂等，实际 {d}")
+    sys.exit(1)
+PYEOF
+
+# 称呼槽位还没确认：提问时模型只能答"没有"（候选正文不会被注入）。
+ask "你怎么称呼我" > "$WORK_DIR/ask_slot_before.json"
+python3 - "$WORK_DIR/ask_slot_before.json" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+answer = d.get("answer") or ""
+if d.get("support_level") == "insufficient" and "确认" in answer and "没有" in answer:
+    print("  ✅ 未确认的槽位诚实回答没有（候选正文不进上下文）")
+else:
+    print(f"  ❌ 未确认槽位应回答没有确认记录，实际: {d.get('support_level')} {answer}")
+    sys.exit(1)
+PYEOF
+
+# 保存称呼偏好 → 确认 → 再问：回答包含确认值（确认后下一轮可见，端到端）。
+ask "记住：以后叫我梁哥" > "$WORK_DIR/ask_slot_save.json"
+CAND2_LIST="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/memory/candidates?status=candidate" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+CAND2_ID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); rows=[c for c in d.get("candidates",[]) if c.get("key")=="称呼"]; print(rows[0]["id"] if rows else "")' "$CAND2_LIST")
+if [ -z "$CAND2_ID" ]; then
+    echo "  ❌ 称呼候选应已保存"
+    FAILED=1
+else
+    curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/memory/confirm" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"candidate_id\": \"$CAND2_ID\"}" > /dev/null
+    ask "你怎么称呼我" > "$WORK_DIR/ask_slot_after.json"
+    python3 - "$WORK_DIR/ask_slot_after.json" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+answer = d.get("answer") or ""
+if "梁哥" in answer and (d.get("support_level")) == "supported":
+    print("  ✅ 确认后下一轮可见：回答依据已确认信息（含来源标注）")
+else:
+    print(f"  ❌ 确认后应能在回答中看到已确认称呼，实际: {d.get('support_level')} {answer}")
+    sys.exit(1)
+PYEOF
+fi
+
+# 纠正走"拒绝"也要守住状态机：新候选被拒绝后，确认尝试必须 409，Profile 不变。
+ask "记住：以后叫我老王" > /dev/null
+CAND3_LIST="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/memory/candidates?status=candidate&limit=10" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")"
+CAND3_ID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); rows=[c for c in d.get("candidates",[]) if c.get("key")=="称呼"]; print(rows[0]["id"] if rows else "")' "$CAND3_LIST")
+if [ -n "$CAND3_ID" ]; then
+    curl -s -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/memory/reject" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"candidate_id\": \"$CAND3_ID\", \"reason\": \"叫错了\"}" > /dev/null
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$SERVER_PORT/api/v1/memory/confirm" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"candidate_id\": \"$CAND3_ID\"}")
+    if [ "$CODE" = "409" ]; then
+        echo "  ✅ 已拒绝的候选不能再确认（409，拒绝是终态）"
+    else
+        echo "  ❌ 拒绝后确认应 409，实际 $CODE"
+        FAILED=1
+    fi
+    PROFILE_AFTER="$(curl -s "http://127.0.0.1:$SERVER_PORT/api/v1/profile?user_id=debug" \
+        -H "Authorization: Bearer $ADMIN_TOKEN")"
+    python3 - "$PROFILE_AFTER" "$CAND3_ID" <<'PYEOF' || FAILED=1
+import json, sys
+d = json.loads(sys.argv[1])
+bad = sys.argv[2]
+values = [e["value"] for e in d.get("entries", []) if e.get("key") == "称呼"]
+if len(values) == 1 and "老王" not in values[0]:
+    print("  ✅ 拒绝的候选不产生投影：称呼槽位只有确认值一个")
+else:
+    print(f"  ❌ 称呼槽位应只有确认值，实际 {values}")
+    sys.exit(1)
+PYEOF
+else
+    echo "  ❌ 老王候选应已保存"
+    FAILED=1
+fi
+
+# /api/v1/ask 返回截断元信息字段（可解释性）。
+ask "你好" > "$WORK_DIR/ask_truncations.json"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert "context_truncations" in d, d' \
+    "$WORK_DIR/ask_truncations.json" || { echo "  ❌ /api/v1/ask 应返回 context_truncations 字段"; FAILED=1; }
 
 # ---- 9. 数据最小化 ----
 
