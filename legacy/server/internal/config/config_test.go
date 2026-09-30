@@ -93,7 +93,7 @@ func TestProfileBlankNameFallsBack(t *testing.T) {
 
 // TestRedactedHasNoAssistantSecrets 覆盖配置摘要不含密钥。
 func TestRedactedHasNoAssistantSecrets(t *testing.T) {
-	t.Setenv("LUMEN_DEEPSEEK_API_KEY", "sk-test-should-not-leak")
+	t.Setenv("LUMEN_DEEPSEEK_API_KEY", "sk-test")
 	t.Setenv("LUMEN_FEISHU_APP_SECRET", "secret-should-not-leak")
 
 	cfg, err := Load()
@@ -104,7 +104,7 @@ func TestRedactedHasNoAssistantSecrets(t *testing.T) {
 
 	for key, value := range redacted {
 		s := strings.TrimSpace(toString(value))
-		if strings.Contains(s, "sk-test-should-not-leak") || strings.Contains(s, "secret-should-not-leak") {
+		if strings.Contains(s, "sk-test") || strings.Contains(s, "secret-should-not-leak") {
 			t.Fatalf("配置摘要 %q 泄露了密钥: %s", key, s)
 		}
 	}

@@ -1,159 +1,89 @@
-# Lumen
+# Lumen v0.01
 
-> Privacy-first Personal AI Context & Memory System  
-> 当前状态：V0.1 已部署到生产并跑通真实链路 ｜ macOS First ｜ 单用户 ｜ 2C2G VPS
+一个单用户、以对话为入口的个人 Agent。只做四件事：聊天、设置定时任务、记录个人信息、管理 Todo。
 
-Lumen 在 Mac 上低打扰地采集工作元数据，在本地完成最小化和隐私过滤，再批量同步到自己的服务器。服务端把事件聚合成 Work Session，并每天调用一次 **DeepSeek API** 生成工作总结。
+## 从零开始的范围
 
-一句话目标：**不用回忆，也能知道昨天做到哪里。**
+- **对话**：DeepSeek / OpenAI 兼容 API，原生 tool calling，多轮历史与个人记忆进入上下文。
+- **记忆**：明确要求「记住」时保存；同名信息覆盖，可查看、修改、删除。
+- **Todo**：自然语言或面板添加、改标题、标记完成、删除，支持截止时间。
+- **定时任务**：一次、每天、每周；提醒原文或到时执行 Agent 指令；可暂停、重新启用、删除，保留结果和错误。
 
-## 当前实现状态
+飞书个人聊天是 v0.01 的主要对话入口，沿用出站长连接；网页用于管理和调试。所有数据存在本机 SQLite，服务重启后仍保留。没有模型密钥时，面板、Todo、记忆和普通定时提醒仍能使用；聊天和定时 Agent 任务需要模型。
 
-第一版代码已经完成，`make e2e` 可以一键验证整条链路。
+旧版桌面采集、工作总结和证据链实现已移至 `legacy/`，不参与新版本运行。旧业务数据库不自动迁移；新数据库默认为 `data/lumen-v001.db`，请勿指向旧库。部署前请停止旧版采集端，旧服务可以保留用于查历史。
 
-| 能力 | 状态 |
-| --- | --- |
-| Window / Idle / Git 三个传感器 | ✅ 已实现（真实读取本机状态） |
-| 本地隐私过滤与字段 allowlist | ✅ 已实现（隐私边界有专门测试覆盖） |
-| 本地 SQLite 与离线同步队列 | ✅ 已实现（断网补传、退避重试） |
-| 批量同步与逐事件 ACK | ✅ 已实现（at-least-once + 幂等） |
-| 设备注册与鉴权 | ✅ 已实现（一次性令牌、token 只存哈希） |
-| 规则 Session Engine | ✅ 已实现（合并、切断、未分类、迟到重算） |
-| DeepSeek 每日总结 | ✅ 已实现（结构化输出校验、幂等、预算控制） |
-| 总结查询接口 | ✅ 已实现 |
-| 飞书总结推送 | ✅ 已实现（长连接、白名单、证据引用） |
-| AI-first 问答（Agent Runtime） | ✅ 已实现（模型出计划 → 工具执行器（策略 + 审计）→ 合成回答） |
-| Agent 任务摘要数据源 | ✅ 已实现（ZCode CLI 入口 → 离线队列 → 幂等入库 → get_task_summaries） |
-| 可配置助手身份 | ✅ 已实现（`LUMEN_ASSISTANT_NAME` 等环境变量驱动，代码不写死名字） |
-| 定时任务与保留清理 | ✅ 已实现（22:30 总结、事件清理、每日快照） |
-| 部署文件与备份脚本 | ✅ 已实现 |
-| 真实部署与联调 | ✅ 已部署到 VPS，真实采集→同步→Session→DeepSeek 总结全链路验证通过 |
-| 飞书真实联调 | ✅ 已实现（长连接、白名单、总结推送与问答全部真机验证） |
-| 连续 7 天稳定性观察 | ⏳ 从 2026-09-17 开始 |
+## 运行
 
-## 快速开始
+Python 3.11+，飞书入口使用官方 SDK；网页核心只需标准库，无需安装 Node、Go 或本地模型。
 
 ```bash
-make setup        # 准备环境（Python venv + pyobjc + Go 依赖）
-make e2e          # 一键端到端联调（假事件 → Session → mock DeepSeek）
-make check        # 全部测试 + 静态检查 + 密钥扫描
+# 在仓库根目录运行；密钥从环境变量读取
+python3 -m pip install -r requirements.txt
+export LUMEN_MODEL_API_KEY='你的模型密钥'
+export LUMEN_MODEL_BASE_URL='https://api.deepseek.com'
+export LUMEN_MODEL='deepseek-chat'
+export LUMEN_FEISHU_APP_ID='你的飞书 App ID'
+export LUMEN_FEISHU_APP_SECRET='你的飞书 App Secret'
+export LUMEN_FEISHU_ALLOWED_USER_IDS='你的 open_id'
+python3 -m lumen
 ```
 
-`make e2e` 不需要任何真实密钥，也不会产生 API 费用。
+在飞书中给机器人发个人消息即可对话；打开 http://127.0.0.1:8787 管理记忆和任务。飞书配置全部留空时仅启动网页。`deploy/lumen.env.example` 列出可选配置；程序不自动加载 .env，需要由 shell / 服务管理器注入。
 
-部署到 VPS 见 [deploy/README.md](deploy/README.md)；本地开发与调试见 [docs/本地开发指南.md](docs/本地开发指南.md)。
+使用 OpenAI 时设置 `LUMEN_MODEL_BASE_URL=https://api.openai.com/v1`，并配置支持 tool calling 的模型名称。其他兼容提供商同理，Base URL 应为 `/chat/completions` 前的部分。
 
-## V0.1 MVP 范围
+远程访问时设置 `LUMEN_HOST=0.0.0.0` 和至少 24 字符的 `LUMEN_ACCESS_TOKEN`；网页顶部输入访问令牌。公网部署需要通过反向代理启用 HTTPS。令牌仅保存在当前浏览器会话，模型密钥不会返回给浏览器。
 
-必须完成：
+## 飞书配置
 
-- Desktop：Python 后台进程、Window / Idle / Git 传感器、本地 SQLite、隐私过滤、批量同步；
-- Server：Go 单进程、SQLite、设备鉴权、事件写入、规则 Session、每日总结；
-- AI：服务端通过 HTTPS 调用 DeepSeek API，VPS 不部署任何模型；
-- Feishu：每日总结推送，以及自然语言问答；使用出站长连接，不新增公网回调端口。
+模型配置也兼容旧版 `LUMEN_DEEPSEEK_API_KEY`、`LUMEN_DEEPSEEK_BASE_URL` 和 `LUMEN_DEEPSEEK_MODEL`，新 MODEL 变量优先。
 
-## 两类数据源：活动记录 vs Agent 报告
+沿用旧版 `LUMEN_FEISHU_APP_ID`、`LUMEN_FEISHU_APP_SECRET`、`LUMEN_FEISHU_ALLOWED_USER_IDS`。v0.01 只允许一个用户 open_id，只响应他的个人文本消息，忽略群聊和其他用户。飞书开发者后台需要启用机器人、开启长连接事件接收、订阅 `im.message.receive_v1`，并授权机器人收发个人消息（`im:message.p2p_msg:readonly`、`im:message:send_as_bot`），发布应用版本并让自己在可用范围内。
 
-Lumen 的数据分两类，可信度不同，回答里必须分开：
+入站消息用 message_id 持久化去重，重连重投不会重复调用模型。机器人回复和定时结果写入持久化发送队列，发送失败会退避重试（最长每小时一次）。飞书发送使用稳定 UUID 降低重试重复，仍依赖平台去重窗口，不保证永久 exactly-once。执行中崩溃的入站消息不会自动重做，请在网页检查已有写入后重新发消息。网络需要允许飞书 HTTPS 和官方长连接 WebSocket 域名。
 
-- **活动记录**（`window.activity` / `idle.state` / `git.activity`）：用了哪些应用、
-  各多久、有哪些提交。从它推出的「完成了什么」是**推断**；
-- **Agent 任务摘要**（`agent.task_summary`）：专业 Agent（如 ZCode）自己汇报的
-  任务标题、状态、已产出结果与未完成事项。这是**结论**本身。
+## 可以直接说
 
-因此问「完成了什么」会走 `get_task_summaries`（标 `supported`），
-问「用了什么、多久」走 `get_sessions`（标 `inferred`）。
-如果模型只拿到活动记录却宣称「完成了某事」，代码会强制把支持等级降为 `inferred`
-并在证据行标注来源，用户能自己判断哪部分可信。
+- 「记住：我喜欢简洁的回答。」
+- 「帮我记一个 Todo：整理本周计划。」
+- 「把整理本周计划标记为完成。」
+- 「明天早上 9 点提醒我交房租。」
+- 「每天晚上 8 点帮我整理还没完成的 Todo，给出明天的建议。」
+- 「忘记我的饮食偏好。」
 
-接入说明见 [docs/Agent任务摘要接入.md](docs/Agent任务摘要接入.md)。
+## 定时执行约定
 
-## 助手是怎么回答问题的（Agent Runtime）
+- 时间默认使用 `Asia/Shanghai`，可通过 `LUMEN_TIMEZONE` 修改。面板时间按服务配置的时区输入，不按浏览器时区。
+- 调度每秒检查一次。服务停止时无法执行，恢复后会补执行到期任务；重复任务积压只执行一次，再跳到下一次未来时间。
+- 结果写入对话和执行记录。浏览器每 4 秒刷新；关闭浏览器不影响后台执行。配置飞书后结果主动推送给主人；没有操作系统通知。
+- 每天 / 每周按配置时区的当地时间重复。未支持 cron、月度、工作日规则。
+- 失败任务暂停，需要手动重新启用并提供未来时间。若执行中服务崩溃，任务标记为中断，不自动重试，避免重复写入。
+- 定时 Agent 可以读取个人数据、管理 Todo 和记忆，不能再创建其他定时任务。任务运行期间不可修改或删除。
+- Todo 的截止时间不会自动变成提醒，提醒需要单独创建。
+- 工具写入成功后立即持久化；后续模型失败不会撤销写入，错误信息会列出已成功操作。没有分布式 exactly-once 保证。
 
-问答不是「正则判意图 → switch 分支 → 固定文案」。默认路径是：
+## 开发与验证
+
+```bash
+make test        # 标准库 unittest：存储、工具、Agent、调度和 HTTP 集成
+make check       # 测试、暂存区敏感信息扫描和 Python 编译检查
+make run
+```
 
 ```text
-用户消息 + 身份 + 有限对话状态 + 工具目录
-  → 模型生成 AgentPlan（严格 JSON Schema）
-  → 工具执行器：策略闸门审批（工具白名单、参数 schema、风险级别、调用数上限）
-  → 执行受限工具（先读后写；来源证据由代码注入）
-  → 每次调用写一条审计（放行 / 拒绝 / 失败）
-  → 结果回交模型合成 Answer（标注 supported / inferred / insufficient / conflicted）
-  → 代码校验来源、支持等级与敏感字段
+lumen/core.py       SQLite、工具、定时调度
+lumen/agent.py      模型客户端与工具调用循环
+lumen/feishu.py     飞书长连接、消息去重、持久化推送
+lumen/__main__.py   HTTP API 与服务入口
+lumen/static/      对话、Todo、记忆、任务面板
+tests/             自动化验证
+scripts/           提交前敏感信息扫描
+legacy/            归档的旧实现，不属于 v0.01
 ```
 
-代码不决定「用户这句话是什么意思」，只决定「模型想做的事允不允许做」。
-正则在模型不可用时仅作为最小安全兜底，不是默认入口。
+API：`GET /api/health`、`GET /api/state`、`POST /api/chat`（`{"message":"…"}`）、`POST /api/action`（`{"name":"add_todo","args":{"title":"…"}}`）。配置了访问令牌时，业务 API 需要 `Authorization: Bearer <token>`。
 
-工具是**声明式**的：名称、中文说明、严格参数 schema、结果 schema、风险级别。
-注册表在装配期校验声明（写错就让启动失败），模型只能从目录里选。
-第一批共 8 个工具：7 个只读（当前时间、身份、对话状态、今天摘要、时段查询、
-项目清单、Agent 任务摘要）+ 1 个低风险写入（保存**候选**记忆，必须带来源、不自动晋升）。
-刻意没有任何 SQL、Shell、文件系统或网络工具。
+个人记忆、Todo、定时任务和最近 30 条聊天消息会发送给所配置的模型提供商。删除记忆后不再作为记忆注入，但原始聊天仍可能出现在最近历史里。删除不是外部模型提供商数据删除。数据量超过上下文限制时会提示清理，v0.01 不做向量检索或自动摘要。
 
-审计落在 `tool_audits` 表：记工具名、风险、清洗后的参数（裁到 64 字）、
-决策与原因、耗时、结果条数与证据条数；**不记结果内容**，也不记用户正文。
-
-助手身份（名字、定位、称呼、语言、语气、主动性）全部由环境变量驱动，
-换人格不需要改代码：`LUMEN_ASSISTANT_NAME`、`LUMEN_ASSISTANT_ROLE`、
-`LUMEN_OWNER_DISPLAY_NAME`、`LUMEN_ASSISTANT_LANGUAGE`、`LUMEN_ASSISTANT_TONE`、
-`LUMEN_ASSISTANT_PROACTIVITY`。
-
-明确延期：剪贴板正文、截图/OCR、Episode、Reflection、长期 Memory 的确认入口、向量检索、主动提醒、多 Agent 拆分、原生 tool_calls 迁移、服务端下行命令、Tray、Timeline、安装包，以及其他平台。
-
-## 技术基线
-
-```text
-Mac: Python + pyobjc + SQLite
-  └─ Window / Idle / Git → Privacy Filter → Sync Queue
-                      HTTPS Batch ↓
-VPS: Caddy + Go + SQLite
-  └─ Event Store → Session Engine → Daily Summary → DeepSeek API
-```
-
-2C2G 足够运行本项目。VPS 只运行 Caddy、Go 服务和 SQLite；LLM 推理由 DeepSeek API 完成。
-
-## 仓库结构
-
-```text
-desktop/    macOS 采集、过滤、本地存储与同步（Python）
-server/     API、事件存储、Session、DeepSeek 总结、Agent 工具层（Go）
-protocol/   两端共享的 JSON Schema 与 golden 样例
-deploy/     Dockerfile、Caddy、Compose、备份脚本
-scripts/    端到端联调脚本与本地验收实例
-docs/       开发指南与手工验收
-```
-
-## 隐私设计（V0.1 核心约束）
-
-这些不是「以后再说」的目标，而是第一版就生效的机制：
-
-- **字段 allowlist**：上传字段逐项构造，而不是先序列化再删敏感字段。将来对象里多出字段也不会意外泄露；
-- **窗口标题默认不上传**：只有命中配置的项目白名单时，才把项目名作为 `context.project` 上传，标题原文始终丢弃；
-- **上传前二次校验**：`validate_payload` 对每个字符串值检查路径、URL、凭证特征，任何一条不过就不上传；
-- **服务端拒绝禁用字段**：`clipboard`、`screen`、`source_code`、`diff`、`window_title` 等字段出现即拒绝整条事件并记安全事件；
-- **发给模型的内容最小化**：只发聚合后的项目、时长、应用名与提交信息，不含原始事件、路径或设备标识；
-- **日志脱敏**：只记录事件 id、类型、状态与 token 用量，不记录完整请求正文与任何凭证；
-- **密钥分层**：DeepSeek Key、飞书 App Secret 只在服务器 `/etc/lumen`，不进入 Git、镜像或构建产物；device_token 只在 macOS 钥匙串。
-
-## 最短开发路线
-
-1. ~~用假事件打通注册、批量同步和幂等入库~~ ✅
-2. ~~接入 Window / Idle / Git，真实运行一天~~ ✅ 代码就绪，待实际运行观察
-3. ~~用规则生成 Session~~ ✅
-4. ~~每晚调用一次 DeepSeek API 生成总结~~ ✅
-5. ~~接入飞书总结与最小问答~~ ✅ 真机验证通过，问答已改造为 AI-first Agent Runtime
-6. 连续运行 7 天后再决定是否加入剪贴板和长期记忆
-
-## 长期方向
-
-Lumen 不以通用电脑控制为主线，而是沿着「感知 → 理解 → 记忆 → 沟通 → 谨慎行动」演进：
-
-- V0.2：把记忆候选的确认入口做出来（现在只存候选、不自动晋升），并补多轮追问；
-- V0.3：可控的剪贴板元数据、本地 Timeline 与连接器；
-- V0.4：用户确认、可纠正、可遗忘的长期记忆；
-- V0.5：低打扰且可解释的主动提醒；
-- V1.0：多设备个人上下文伙伴，并为外部 Agent 提供最小权限 Context API。
-
-产品与架构文档单独维护，不随代码仓库公开；仓库内的模块 README 记录的是
-实现约束与踩过的坑，改代码前先读对应模块的 README。
+v0.01 不提供桌面监控、电脑控制、Shell 工具、多 Agent、插件市场、多用户系统。先把对话与这三个个人工具做好。

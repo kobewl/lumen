@@ -414,7 +414,7 @@ func TestSessionsRejectsBadDate(t *testing.T) {
 
 func TestHealthzDoesNotLeakSecrets(t *testing.T) {
 	env := newTestEnv(t, nil)
-	env.cfg.DeepSeekAPIKey = "sk-super-secret-value"
+	env.cfg.DeepSeekAPIKey = "sk-test"
 	env.cfg.FeishuAppSecret = "feishu-secret-value"
 
 	rec := env.do(t, http.MethodGet, "/api/v1/healthz", nil, "")
@@ -422,7 +422,7 @@ func TestHealthzDoesNotLeakSecrets(t *testing.T) {
 		t.Fatalf("健康检查失败: %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, secret := range []string{"sk-super-secret-value", "feishu-secret-value", testEnrollmentToken} {
+	for _, secret := range []string{"sk-test", "feishu-secret-value", testEnrollmentToken} {
 		if bytes.Contains([]byte(body), []byte(secret)) {
 			t.Fatalf("健康检查泄露了敏感值: %s", secret)
 		}

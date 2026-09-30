@@ -1,0 +1,4 @@
+# 飞书长连接与消息发送；网页核心只需 Python 标准库。
+lark-oapi==1.5.3
+# SDK uses the legacy websocket handshake exception interface.
+websockets>=13,<14
