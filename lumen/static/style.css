@@ -2,3 +2,5 @@
 @media(max-width:800px){header{flex-wrap:wrap;height:auto;min-height:64px;padding:12px 20px}#status{order:3;flex-basis:100%}}
 
 nav{flex-wrap:wrap}nav button{flex:1 0 26%}.filters{margin:12px 0}.card>button{margin:5px 5px 0 0}
+
+.briefing{white-space:pre-wrap;line-height:1.85;background:#edf3e8;border-radius:12px;padding:16px;margin-top:0}#activity-list{max-height:460px;overflow:auto}#task-detail-form{padding:12px;background:#f0f4ed;border-radius:12px}.message pre{overflow:auto;white-space:pre-wrap;background:#f1f4ee;border-radius:8px;padding:12px}

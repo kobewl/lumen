@@ -35,7 +35,7 @@ enrollment_token*
 register.json
 *.token
 
-# --- 本地数据（事件库、备份、日志都不进仓库）---
+# --- 本地数据（个人数据库、备份、日志都不进仓库）---
 *.db
 *.db-wal
 *.db-shm
@@ -63,26 +63,9 @@ htmlcov/
 dist/
 build/
 
-# --- Go ---
-bin/
-lumen-server
-*.test
-*.out
-vendor/
-
-# --- Node（将来可能用到）---
-node_modules/
-npm-debug.log*
-
 # --- 编辑器 ---
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
-# 注意：以下锁文件必须提交，不要忽略
-#   go.sum / requirements.txt / package-lock.json
-
-# --- 本地验收实例（scripts/dev_local_up.sh 的产物）---
-.dev-local/

@@ -106,6 +106,14 @@ class ConversationTest(unittest.TestCase):
         Agent(self.store, self.actions, model).reply('最后保持未完成')
         self.assertEqual(self.store.state()['todos'][0]['done'], 0)
 
+    def test_note_updates_can_return_to_previous_content(self):
+        note = self.actions.execute('save_note', {'title': '计划', 'content': 'A'})
+        model = ScriptModel([call('save_note', {'id': note['id'], 'title': '计划', 'content': content})
+                             for content in ('A', 'B', 'A')]
+                            + [{'role': 'assistant', 'content': '最终保留 A。'}])
+        Agent(self.store, self.actions, model).reply('修改后保留原内容')
+        self.assertEqual(self.store.state()['notes'][0]['content'], 'A')
+
     def test_history_budget_keeps_recent_contiguous_turns(self):
         for i in range(8):
             self.store.message('user', f'{i}-'+('a'*2000))

@@ -31,6 +31,9 @@ def migrate(db):
                 id TEXT PRIMARY KEY, action TEXT NOT NULL, record_id TEXT,
                 changes TEXT NOT NULL, created_at TEXT NOT NULL,
                 undone INTEGER NOT NULL DEFAULT 0, actor TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS chat_requests (
+                id TEXT PRIMARY KEY, message TEXT NOT NULL, status TEXT NOT NULL,
+                reply TEXT, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS usage (
                 id TEXT PRIMARY KEY, model TEXT NOT NULL, input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL, created_at TEXT NOT NULL);

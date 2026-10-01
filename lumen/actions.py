@@ -22,9 +22,12 @@ class Actions:
         with self.store.transaction() as db:
             expired = db.execute("SELECT id FROM memories WHERE status!='expired' AND expires_at IS NOT NULL AND expires_at<=?", (stamp(),)).fetchall()
             if expired:
+                expired_changes=Changes(db)
                 for item in expired:
+                    expired_changes.touch('memories',item['id'])
                     db.execute("UPDATE memories SET status='expired' WHERE id=?", (item['id'],))
                 self.store.reset_context(db)
+                expired_changes.finish('expire_memory',expired[0]['id'],'system')
         memories = self.store.query("SELECT * FROM memories WHERE status='confirmed' AND (expires_at IS NULL OR expires_at>?) ORDER BY updated_at DESC LIMIT 40", (stamp(),))
         todos = self.store.query("SELECT * FROM todos WHERE done=0 ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,due_at IS NULL,due_at,created_at DESC LIMIT 30")
         schedules = self.store.query("SELECT * FROM schedules WHERE enabled=1 ORDER BY run_at LIMIT 15")
@@ -65,6 +68,17 @@ class Actions:
             raise ValueError('此操作需要用户明确确认，请使用管理面板或快捷命令')
         if scheduled and name in ('create_schedule','update_schedule','delete_schedule','save_memory','delete_memory','confirm_memory','apply_plan','reject_plan','propose_plan','snooze_schedule'):
             raise ValueError('定时执行不能修改记忆或管理其他定时任务')
+        if name=='undo_change':
+            from .operations import undo
+            return undo(self,args.get('id'))
+        if name=='get_activity':
+            from .operations import activity
+            return {'activity':activity(self.store)}
+        if name=='retry_delivery':
+            with self.store.transaction() as db:
+                require(db,'deliveries',args['id'])
+                db.execute("UPDATE deliveries SET status='pending',next_at=?,last_error=NULL WHERE id=?",(stamp(),args['id']))
+            return {'ok':True,'id':args['id'],'action':name}
         if name=='get_today':
             from .briefing import briefing
             return briefing(self,args.get('mode','today'))
@@ -92,9 +106,9 @@ class Actions:
                     raise ValueError('这个名称属于另一条记忆，请先确认要修改哪一条')
                 if actor=='agent' and row.get('status')=='confirmed' and args.get('status')=='pending':
                     raise ValueError('已有确认记忆；候选更正请先询问用户，不覆盖原事实')
-                expiry = self.date(args['expires_at'],future=True) if args.get('expires_at') else (None if 'expires_at' in args else row.get('expires_at'))
+                expiry = self.date(args['expires_at'],future=True) if args.get('expires_at') else (None if 'expires_at' in args else None if row.get('status')=='expired' else row.get('expires_at'))
                 changes.put('memories',record_id,{'key':key,'content':args['content'].strip(),'updated_at':stamp(),
-                    'category':args.get('category',row.get('category','personal')),'status':args.get('status',row.get('status','confirmed')),
+                    'category':args.get('category',row.get('category','personal')),'status':args.get('status','confirmed' if row.get('status')=='expired' else row.get('status','confirmed')),
                     'expires_at':expiry,'source':actor})
             elif name=='delete_memory':
                 require(db,'memories',record_id)

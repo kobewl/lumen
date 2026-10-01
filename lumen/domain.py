@@ -5,6 +5,7 @@ from .contracts import S, identifier, stamp, tool
 EMPTY = {'type': 'string', 'minLength': 0}
 TABLES = {'memory': 'memories', 'todo': 'todos', 'note': 'notes', 'project': 'projects', 'schedule': 'schedules', 'plan':'plans'}
 DOMAIN_TOOLS = [
+    tool('get_activity','读取近期操作回执，不含历史私密内容。实际撤销需要用户发送 /undo 或使用面板。',{}),
     tool('propose_plan', '为用户目标拟定计划草稿，不创建任务。用户必须在网页确认或发送 /approve ID 才会落地。id 可选，修改未确认草稿。', {'id':S,'title':S,'goal':EMPTY,'steps':{'type':'array','items':{'type':'string'},'minItems':1,'maxItems':20}}, ['title','steps']),
     tool('search_records', '关键词搜索个人记录，仅搜索已确认未过期记忆，结果包含真实 ID。',
          {'query': {**S, 'maxLength': 200}, 'scope': {'type': 'string', 'enum': ['all', 'memories', 'todos', 'notes', 'projects','plans']}}, ['query']),
@@ -16,7 +17,7 @@ DOMAIN_TOOLS = [
          'status': {'type': 'string', 'enum': ['active', 'completed', 'paused']}}, ['title']),
     tool('delete_project', '删除项目并解除任务归属，任务保留。', {'id': S}, ['id']),
 ]
-USER_ACTIONS = [tool('confirm_memory', '用户确认候选记忆。', {'id': S}, ['id']),
+USER_ACTIONS = [tool('undo_change','用户撤销一项事务操作，id 可选默认最近操作。',{'id':S}),tool('retry_delivery','用户重试飞书发送。',{'id':S},['id']),tool('confirm_memory', '用户确认候选记忆。', {'id': S}, ['id']),
     tool('apply_plan','用户确认计划并创建项目和任务。',{'id':S},['id']),
     tool('reject_plan','用户取消待确认计划。',{'id':S},['id'])]
 
@@ -80,7 +81,14 @@ def search(actions, query, scope='all'):
             params.append(stamp())
         rows = actions.store.query(f'SELECT * FROM {table} WHERE {where} ORDER BY rowid DESC LIMIT 20', params)
         results.extend({'type': table, **row} for row in rows)
-    return {'records': results[:40], 'query': query, 'limit': 40}
+    for record in results:
+        for key in ('content','notes','goal','steps'):
+            if isinstance(record.get(key),str) and len(record[key])>1000:
+                record[key]=record[key][:1000]
+                record['truncated']=True
+        for key in ('title','key'):
+            if key in record:record[key]=record[key][:200]
+    return {'records': results[:20], 'query': query, 'limit':20,'hint':'完整内容请用 get_record 查询'}
 
 
 def execute(actions, db, changes, name, args, record_id):

@@ -15,6 +15,7 @@ class Feishu:
     def __init__(self, store, agent, owner, sender=None):
         self.store, self.agent, self.owner = store, agent, owner
         self.sender = sender
+        self.ws = None
         self.stop = threading.Event()
         self.incoming = queue.Queue(maxsize=100)
 
@@ -116,6 +117,9 @@ class Feishu:
                 logging.exception('Feishu delivery failed')
             self.stop.wait(1)
 
+    def status(self):
+        return {'enabled':True,'long_connection':'connected' if self.ws and getattr(self.ws,'_conn',None) else 'connecting'}
+
     def start(self, app_id, app_secret):
         # The official SDK binds an asyncio loop during import.
         ready = threading.Event()
@@ -140,6 +144,7 @@ class Feishu:
                 failures.append(exc)
                 ready.set()
                 return
+            self.ws=ws
             ready.set()
             while not self.stop.is_set():
                 try:

@@ -15,6 +15,7 @@ from .contracts import S, now, stamp, identifier, tool
 
 class Store:
     def __init__(self, path):
+        self.path = str(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
@@ -52,8 +53,10 @@ class Store:
         # Do not silently repeat potentially completed writes after a crash.
         self.db.execute("UPDATE schedules SET status='failed', enabled=0, last_error='执行中断；请检查结果后重新启用' WHERE status='running'")
         self.db.execute("UPDATE feishu_inbox SET status='interrupted' WHERE status='processing'")
+        self.db.execute("UPDATE chat_requests SET status='interrupted' WHERE status='processing'")
         self.db.commit()
-        os.chmod(path, 0o600)
+        for filename in (str(path),str(path)+'-wal',str(path)+'-shm'):
+            if Path(filename).exists():os.chmod(filename,0o600)
 
     @contextmanager
     def transaction(self):
