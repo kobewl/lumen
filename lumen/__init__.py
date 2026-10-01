@@ -1,2 +1,2 @@
-"""Lumen: a small, single-user conversational agent."""
-__version__ = "0.01.1"
+"""Lumen personal assistant."""
+__version__ = "0.2.0"

@@ -1,11 +1,11 @@
-# v0.01 运行与部署
+# 运行、升级与数据
 
-使用 Python 3.11+，先 `python3 -m pip install -r requirements.txt`，在仓库根目录执行 `python3 -m lumen`。将 `lumen.env.example` 中配置注入进程环境；密钥只放主机本地配置，不能进入 Git。
+Python 3.11+，在仓库根目录执行 `python3 -m pip install -r requirements.txt`，由 shell 或服务管理器注入 `lumen.env.example` 中的配置，启动 `python3 -m lumen`。进程保持运行，飞书长连接与定时执行才能工作。
 
-常驻运行可使用 systemd，`WorkingDirectory` 指向仓库根目录，`ExecStart` 为 Python 的绝对路径加 `-m lumen`，通过 `EnvironmentFile` 读取本机配置，并设置 `Restart=on-failure`。定时任务依赖这个常驻进程。
+从 v0.01.1 升级时继续使用原 SQLite 数据库和模型、飞书凭据。启动进行增量表/字段升级。重启前备份数据库，关闭旧进程后启动新进程，不要同时运行两套机器人。
 
-从旧版切换时先备份旧库、保留旧服务配置，停止旧采集端。新版本使用独立 `lumen-v001.db`，不迁移旧事件或工作总结；飞书 App ID、Secret 和单用户 open_id 可沿用。切换时停止旧机器人进程，避免同一消息被新旧服务重复处理。旧部署文件存放在 `legacy/deploy/`，不能直接用于新版本。
+systemd 的 WorkingDirectory 指向仓库根目录，ExecStart 指向 Python 解释器并附加 `-m lumen`，EnvironmentFile 指向本机配置文件，Restart=on-failure。模型密钥和飞书 Secret 留在本机配置，不提交 Git。
 
-默认仅监听 localhost，可通过 SSH 隧道访问。对外监听需设置访问令牌并配置 HTTPS 反向代理，推荐仅允许自己的设备访问。
+默认监听 localhost，可用 SSH 隧道访问网页。对外监听需要至少 24 字符访问令牌，并通过 HTTPS 反向代理访问。
 
-备份：停服务后复制整个数据目录；在线备份使用 SQLite 的 backup API（不要只复制 WAL 模式下的 .db 文件）。恢复时停止进程、替换备份、重新启动。业务库包含个人信息和完整聊天，备份需妥善保管。
+备份使用 SQLite backup API；在线不要只复制 .db 文件，因为可能存在未合并的 WAL。恢复时停止服务，恢复数据库，验证 `PRAGMA integrity_check`，再启动。数据库、导出和备份包含个人信息，需要自行妥善保管。

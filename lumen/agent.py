@@ -74,7 +74,9 @@ class Agent:
         system = f'''你是 {name}，一个单用户个人对话助手。
 当前时间：{datetime.now(self.actions.zone).isoformat()}。用户时区：{self.actions.zone.key}。
 交流风格：{tone}。直接回应用户，普通聊天无需列工具或解释内部步骤。
-帮助用户聊天、管理 Todo、保存个性化信息和设置定时任务。
+帮助用户聊天、管理 Todo 与项目、保存知识笔记和个性化信息、设置定时任务。
+只把已确认且未过期的记忆作为个人事实。随口透露的长期偏好可以提议为 pending 候选，并告诉用户需在面板确认；不要自动确认。
+个人状态是有限摘要，记录数量多时用 search_records 搜索，再用 get_record 读取真实记录；回答笔记内容时给出实际标题，不编造出处。
 必须通过工具完成写入，只有工具返回 ok=true 才能说已完成。用真实 ID，不能编造。
 记忆规则：
 - 只在用户明确要求记住个人事实或更正已保存事实时写记忆。不要把随口聊天、猜测、待办内容记成人格。
@@ -100,6 +102,7 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
         if not scheduled and text.strip() in ('/new', '新对话'):
             return self.new_conversation()
         with self.lock:
+            self.actions.context()  # Expire temporary memories before reading chat history.
             history = self.store.history()
             messages = self.messages(text, history)
             if not scheduled:
@@ -136,7 +139,7 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
                             signature = (function['name'], json.dumps(args, sort_keys=True, ensure_ascii=False))
                             result = write_results.get(signature)
                             if result is None:
-                                result = self.actions.execute(function['name'], args, scheduled=scheduled)
+                                result = self.actions.execute(function['name'], args, scheduled=scheduled, actor='agent')
                                 if result.get('ok'):
                                     if function['name'] in ('add_todo', 'create_schedule'):
                                         write_results[signature] = result

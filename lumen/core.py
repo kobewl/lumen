@@ -10,16 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
-def now():
-    return datetime.now(timezone.utc)
-
-
-def stamp(value=None):
-    return (value or now()).isoformat()
-
-
-def identifier():
-    return uuid.uuid4().hex
+from .contracts import S, now, stamp, identifier, tool
 
 
 class Store:
@@ -56,6 +47,8 @@ class Store:
                 id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, scheduled_at TEXT NOT NULL,
                 status TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL);
         ''')
+        from .migrations import migrate
+        migrate(self.db)
         # Do not silently repeat potentially completed writes after a crash.
         self.db.execute("UPDATE schedules SET status='failed', enabled=0, last_error='执行中断；请检查结果后重新启用' WHERE status='running'")
         self.db.execute("UPDATE feishu_inbox SET status='interrupted' WHERE status='processing'")
@@ -109,26 +102,20 @@ class Store:
             'schedules': self.query('SELECT * FROM schedules ORDER BY run_at'),
             'deliveries': self.query('SELECT id,status,attempts,last_error FROM deliveries ORDER BY rowid DESC LIMIT 30'),
             'runs': self.query('SELECT * FROM runs ORDER BY rowid DESC LIMIT 30'),
+            'notes': self.query('SELECT * FROM notes ORDER BY updated_at DESC'),
+            'projects': self.query('SELECT * FROM projects ORDER BY created_at DESC'),
         }
 
 
-def tool(name, description, properties, required=()):
-    return {'type': 'function', 'function': {
-        'name': name, 'description': description,
-        'parameters': {'type': 'object', 'properties': properties,
-                       'required': list(required), 'additionalProperties': False}}}
-
-
-S = {'type': 'string'}
 TOOLS = [
     tool('get_state', '读取个人记忆、Todo 和定时任务及其真实 ID。', {}),
     tool('save_memory', '保存用户明确要求记住的个人事实。更正已有事实时必须传真实 id，可更改 key；同一 key 覆盖旧值，不创建同义重复条目。',
-         {'id': S, 'key': S, 'content': S}, ['key', 'content']),
+         {'id': S, 'key': S, 'content': S, 'category': {'type':'string','enum':['personal','preference','work','temporary']}, 'status': {'type':'string','enum':['confirmed','pending']}, 'expires_at': {'type':'string','minLength':0}}, ['key', 'content']),
     tool('delete_memory', '按真实 ID 删除用户要求忘记的信息，同时重置短期模型上下文，避免从旧聊天重新读到。', {'id': S}, ['id']),
     tool('add_todo', '记录待办。due_at 可选，必须是带时区的 ISO8601；截止日期不会自动创建提醒。',
-         {'title': S, 'due_at': S}, ['title']),
+         {'title': S, 'due_at': {'type':'string','minLength':0}, 'priority': {'type':'string','enum':['high','normal','low']}, 'project_id': {'type':'string','minLength':0}, 'notes': {'type':'string','minLength':0}, 'remind_at': S}, ['title']),
     tool('update_todo', '修改真实 ID 对应的待办标题或完成状态。',
-         {'id': S, 'title': S, 'done': {'type': 'boolean'}}, ['id']),
+         {'id': S, 'title': S, 'done': {'type': 'boolean'}, 'due_at': {'type':'string','minLength':0}, 'priority': {'type':'string','enum':['high','normal','low']}, 'project_id': {'type':'string','minLength':0}, 'notes': {'type':'string','minLength':0}, 'remind_at': {'type':'string','minLength':0}}, ['id']),
     tool('delete_todo', '删除指定待办。', {'id': S}, ['id']),
     tool('create_schedule', '创建未来定时任务。reminder 到时发送 prompt 原文；agent 到时执行 prompt。repeat 支持 none/daily/weekly，按用户时区重复。',
          {'title': S, 'prompt': S, 'run_at': S,
@@ -139,91 +126,16 @@ TOOLS = [
          {'id': S, 'enabled': {'type': 'boolean'}, 'run_at': S}, ['id', 'enabled']),
     tool('delete_schedule', '删除定时任务，历史执行结果仍保留。', {'id': S}, ['id']),
 ]
-CATALOG = {t['function']['name']: t['function']['parameters'] for t in TOOLS}
+from .domain import DOMAIN_TOOLS, USER_ACTIONS
+TOOLS.extend(DOMAIN_TOOLS)
+CATALOG = {t['function']['name']: t['function']['parameters'] for t in [*TOOLS, *USER_ACTIONS]}
 
 
-class Actions:
-    def __init__(self, store, timezone_name='Asia/Shanghai'):
-        self.store = store
-        self.zone = ZoneInfo(timezone_name)
-
-    def date(self, value, future=False):
-        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        if dt.tzinfo is None:
-            raise ValueError('时间必须包含时区，例如 2026-10-01T09:00:00+08:00')
-        if future and dt <= now():
-            raise ValueError('执行时间必须在未来')
-        return stamp(dt.astimezone(timezone.utc))
-
-    def execute(self, name, args, scheduled=False):
-        if not isinstance(name, str):
-            raise ValueError('工具名称必须是字符串')
-        schema = CATALOG.get(name)
-        if schema is None or not isinstance(args, dict):
-            raise ValueError('未知工具或无效参数')
-        if set(args) - set(schema['properties']) or set(schema['required']) - set(args):
-            raise ValueError('缺少必要参数或存在未知参数')
-        for key, value in args.items():
-            prop = schema['properties'][key]
-            if prop['type'] == 'boolean':
-                if type(value) is not bool:
-                    raise ValueError(f'{key} 必须为布尔值')
-            elif not isinstance(value, str) or not value.strip() or len(value) > 4000:
-                raise ValueError(f'{key} 必须是 1–4000 字符的文本')
-            if 'enum' in prop and value not in prop['enum']:
-                raise ValueError(f'{key} 取值无效')
-        if scheduled and name in ('create_schedule', 'update_schedule', 'delete_schedule'):
-            raise ValueError('定时执行期间不能创建或修改其他定时任务')
-        if name == 'get_state':
-            state = self.store.state()
-            return {k: state[k] for k in ('memories', 'todos', 'schedules')}
-        record_id = args.get('id', identifier())
-        with self.store.transaction() as db:
-            if name == 'save_memory':
-                key, content = args['key'].strip(), args['content'].strip()
-                if 'id' in args:
-                    if not db.execute('SELECT 1 FROM memories WHERE id=?', (record_id,)).fetchone():
-                        raise ValueError('记忆不存在，请先读取真实 ID')
-                    conflict = db.execute('SELECT id FROM memories WHERE key=? AND id!=?', (key, record_id)).fetchone()
-                    if conflict:
-                        raise ValueError('这个名称属于另一条记忆，请先确认要修改哪一条')
-                    db.execute('UPDATE memories SET key=?,content=?,updated_at=? WHERE id=?',
-                               (key, content, stamp(), record_id))
-                else:
-                    db.execute('''INSERT INTO memories VALUES (?,?,?,?)
-                        ON CONFLICT(key) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at''',
-                               (record_id, key, content, stamp()))
-                    record_id = db.execute('SELECT id FROM memories WHERE key=?', (key,)).fetchone()[0]
-            elif name == 'add_todo':
-                due = self.date(args['due_at']) if 'due_at' in args else None
-                db.execute('INSERT INTO todos VALUES (?,?,?,0,?)', (record_id, args['title'], due, stamp()))
-            elif name == 'create_schedule':
-                run_at = self.date(args['run_at'], future=True)
-                db.execute('INSERT INTO schedules (id,title,prompt,kind,run_at,repeat,created_at) VALUES (?,?,?,?,?,?,?)',
-                           (record_id, args['title'], args['prompt'], args['kind'], run_at, args['repeat'], stamp()))
-            else:
-                table = 'memories' if name.endswith('memory') else 'todos' if name.endswith('todo') else 'schedules'
-                row = db.execute(f'SELECT * FROM {table} WHERE id=?', (record_id,)).fetchone()
-                if row is None:
-                    raise ValueError('记录不存在，请先读取真实 ID')
-                if table == 'schedules' and row['status'] == 'running':
-                    raise ValueError('任务正在执行，请完成后再修改')
-                if name.startswith('delete_'):
-                    db.execute(f'DELETE FROM {table} WHERE id=?', (record_id,))
-                    if name == 'delete_memory':
-                        self.store.reset_context(db)
-                elif name == 'update_todo':
-                    if not ('title' in args or 'done' in args):
-                        raise ValueError('需要提供 title 或 done')
-                    db.execute('UPDATE todos SET title=?, done=? WHERE id=?',
-                               (args.get('title', row['title']), int(args.get('done', row['done'])), record_id))
-                elif name == 'update_schedule':
-                    if args['enabled'] and 'run_at' not in args:
-                        raise ValueError('重新启用任务需要提供未来 run_at')
-                    run_at = self.date(args['run_at'], future=True) if args['enabled'] else row['run_at']
-                    db.execute("UPDATE schedules SET enabled=?,run_at=?,status='pending',last_error=NULL WHERE id=?",
-                               (int(args['enabled']), run_at, record_id))
-        return {'ok': True, 'id': record_id, 'action': name}
+def __getattr__(name):
+    if name == 'Actions':
+        from .actions import Actions
+        return Actions
+    raise AttributeError(name)
 
 
 class Scheduler:
