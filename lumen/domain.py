@@ -3,10 +3,11 @@ import json
 from .contracts import S, identifier, stamp, tool
 
 EMPTY = {'type': 'string', 'minLength': 0}
-TABLES = {'memory': 'memories', 'todo': 'todos', 'note': 'notes', 'project': 'projects', 'schedule': 'schedules'}
+TABLES = {'memory': 'memories', 'todo': 'todos', 'note': 'notes', 'project': 'projects', 'schedule': 'schedules', 'plan':'plans'}
 DOMAIN_TOOLS = [
+    tool('propose_plan', '为用户目标拟定计划草稿，不创建任务。用户必须在网页确认或发送 /approve ID 才会落地。id 可选，修改未确认草稿。', {'id':S,'title':S,'goal':EMPTY,'steps':{'type':'array','items':{'type':'string'},'minItems':1,'maxItems':20}}, ['title','steps']),
     tool('search_records', '关键词搜索个人记录，仅搜索已确认未过期记忆，结果包含真实 ID。',
-         {'query': {**S, 'maxLength': 200}, 'scope': {'type': 'string', 'enum': ['all', 'memories', 'todos', 'notes', 'projects']}}, ['query']),
+         {'query': {**S, 'maxLength': 200}, 'scope': {'type': 'string', 'enum': ['all', 'memories', 'todos', 'notes', 'projects','plans']}}, ['query']),
     tool('get_record', '按真实 ID 读取完整记录。', {'type': {'type': 'string', 'enum': list(TABLES)}, 'id': S}, ['type', 'id']),
     tool('save_note', '保存想法、资料或随手记，提供 id 时修改原笔记。笔记不是人格记忆。',
          {'id': S, 'title': S, 'content': {**S, 'maxLength': 12000}, 'tags': EMPTY}, ['title', 'content']),
@@ -15,7 +16,9 @@ DOMAIN_TOOLS = [
          'status': {'type': 'string', 'enum': ['active', 'completed', 'paused']}}, ['title']),
     tool('delete_project', '删除项目并解除任务归属，任务保留。', {'id': S}, ['id']),
 ]
-USER_ACTIONS = [tool('confirm_memory', '用户确认候选记忆。', {'id': S}, ['id'])]
+USER_ACTIONS = [tool('confirm_memory', '用户确认候选记忆。', {'id': S}, ['id']),
+    tool('apply_plan','用户确认计划并创建项目和任务。',{'id':S},['id']),
+    tool('reject_plan','用户取消待确认计划。',{'id':S},['id'])]
 
 
 class Changes:
@@ -67,7 +70,7 @@ def search(actions, query, scope='all'):
     pattern = '%' + escaped + '%'
     results = []
     for table, fields in [('memories', ('key', 'content')), ('todos', ('title', 'notes')),
-                          ('notes', ('title', 'content', 'tags')), ('projects', ('title', 'goal'))]:
+                          ('notes', ('title', 'content', 'tags')), ('projects', ('title', 'goal')),('plans',('title','goal','steps'))]:
         if scope not in ('all', table):
             continue
         where = ' OR '.join(f"{field} LIKE ? ESCAPE '\\'" for field in fields)
@@ -81,7 +84,27 @@ def search(actions, query, scope='all'):
 
 
 def execute(actions, db, changes, name, args, record_id):
-    if name == 'save_note':
+    if name == 'propose_plan':
+        row = require(db,'plans',record_id) if 'id' in args else {}
+        if row and row['status']!='pending':
+            raise ValueError('已处理的计划不可修改，请新建草稿')
+        changes.put('plans',record_id,{'title':args['title'],'goal':args.get('goal',row.get('goal','')),
+            'steps':json.dumps(args['steps'],ensure_ascii=False),'status':'pending','created_at':row.get('created_at',stamp())})
+    elif name in ('apply_plan','reject_plan'):
+        row = require(db,'plans',record_id)
+        if row['status']=='applied' and name=='apply_plan':
+            return record_id
+        if row['status']!='pending':
+            raise ValueError('计划已经处理')
+        if name=='reject_plan':
+            changes.put('plans',record_id,{'status':'rejected'})
+        else:
+            project = identifier()
+            changes.put('projects',project,{'title':row['title'],'goal':row['goal'],'created_at':stamp()})
+            for step in json.loads(row['steps']):
+                changes.put('todos',identifier(),{'title':step,'project_id':project,'created_at':stamp()})
+            changes.put('plans',record_id,{'status':'applied','project_id':project})
+    elif name == 'save_note':
         if 'id' in args:
             require(db, 'notes', record_id)
         changes.put('notes', record_id, {'title': args['title'].strip(), 'content': args['content'].strip(), 'tags': args.get('tags', ''), 'updated_at': stamp()})

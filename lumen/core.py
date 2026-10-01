@@ -104,6 +104,7 @@ class Store:
             'runs': self.query('SELECT * FROM runs ORDER BY rowid DESC LIMIT 30'),
             'notes': self.query('SELECT * FROM notes ORDER BY updated_at DESC'),
             'projects': self.query('SELECT * FROM projects ORDER BY created_at DESC'),
+            'plans': self.query('SELECT * FROM plans ORDER BY created_at DESC'),
         }
 
 

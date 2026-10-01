@@ -64,6 +64,37 @@ class Agent:
             self.store.message('assistant', reply)
             return reply
 
+    def command(self, text):
+        if not text.startswith('/'):
+            return None
+        parts = text.split(maxsplit=1)
+        command, argument = parts[0], parts[1] if len(parts)>1 else ''
+        state = self.store.state()
+        if command=='/help':
+            return '/new 新对话\n/todos 待办\n/memory 个人记忆\n/notes 笔记\n/projects 项目\n/plans 计划草稿\n/approve ID 确认计划\n/reject ID 取消计划\n/remember ID 确认候选记忆'
+        lists = {'/todos':('todos','title'),'/memory':('memories','key'),'/notes':('notes','title'),'/projects':('projects','title'),'/plans':('plans','title')}
+        if command in lists:
+            table, title = lists[command]
+            rows = state[table][:20]
+            if command=='/todos':
+                rows = [row for row in state[table] if not row['done']][:20]
+            if not rows:
+                return '暂无记录。'
+            return '\n\n'.join(row['id'][:8]+' · '+row[title]+('\n'+row['content'] if table=='memories' else '')
+                +('\n'+row['status']+'\n'+'\n'.join('· '+step for step in json.loads(row['steps'])) if table=='plans' else '') for row in rows)
+        confirm = {'/approve':('plans','apply_plan'),'/reject':('plans','reject_plan'),'/remember':('memories','confirm_memory')}
+        if command in confirm:
+            table, action = confirm[command]
+            rows = [row for row in state[table] if len(argument)>=8 and row['id'].startswith(argument)]
+            if len(rows)!=1:
+                return '请提供唯一记录 ID（至少前 8 位）；先用 /plans 或 /memory 查看。'
+            try:
+                result = self.actions.execute(action,{'id':rows[0]['id']})
+            except ValueError as exc:
+                return str(exc)
+            return '已完成：'+{'apply_plan':'计划已创建为项目和任务','reject_plan':'计划已取消','confirm_memory':'候选信息已记住'}[action]+'。'
+        return '未知命令，发送 /help 查看可用命令。'
+
     def messages(self, text, history, completed=()):
         state = self.actions.execute('get_state', {})
         context = json.dumps(state, ensure_ascii=False)
@@ -75,6 +106,7 @@ class Agent:
 当前时间：{datetime.now(self.actions.zone).isoformat()}。用户时区：{self.actions.zone.key}。
 交流风格：{tone}。直接回应用户，普通聊天无需列工具或解释内部步骤。
 帮助用户聊天、管理 Todo 与项目、保存知识笔记和个性化信息、设置定时任务。
+用户提出一个需要多步推进的目标时，使用 propose_plan 保存草稿，给出真实计划 ID 与步骤，告知发送 /approve ID 或网页确认后才创建任务；不能把草稿说成已经执行。
 只把已确认且未过期的记忆作为个人事实。随口透露的长期偏好可以提议为 pending 候选，并告诉用户需在面板确认；不要自动确认。
 个人状态是有限摘要，记录数量多时用 search_records 搜索，再用 get_record 读取真实记录；回答笔记内容时给出实际标题，不编造出处。
 必须通过工具完成写入，只有工具返回 ok=true 才能说已完成。用真实 ID，不能编造。
@@ -102,6 +134,11 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
         if not scheduled and text.strip() in ('/new', '新对话'):
             return self.new_conversation()
         with self.lock:
+            answer = self.command(text) if not scheduled else None
+            if answer is not None:
+                self.store.message('user',text)
+                self.store.message('assistant',answer)
+                return answer
             self.actions.context()  # Expire temporary memories before reading chat history.
             history = self.store.history()
             messages = self.messages(text, history)
@@ -141,7 +178,7 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
                             if result is None:
                                 result = self.actions.execute(function['name'], args, scheduled=scheduled, actor='agent')
                                 if result.get('ok'):
-                                    if function['name'] in ('add_todo', 'create_schedule'):
+                                    if function['name'] in ('add_todo', 'create_schedule','save_note','save_project','propose_plan'):
                                         write_results[signature] = result
                                     completed.append(result)
                                     changed = True

@@ -36,7 +36,11 @@ class Actions:
                 for key,value in list(row.items()):
                     if isinstance(value,str):
                         row[key] = value[:(800 if key=='content' else 200 if key in ('key','title') else 400)]
-        return {'memories':memories,'todos':todos,'schedules':schedules,'notes':notes,'projects':projects,
+        plans = self.store.query("SELECT * FROM plans WHERE status='pending' ORDER BY created_at DESC LIMIT 3")
+        for item in plans:
+            import json
+            item['steps'] = [step[:120] for step in json.loads(item['steps'])]
+        return {'plans':plans,'memories':memories,'todos':todos,'schedules':schedules,'notes':notes,'projects':projects,
                 'counts':counts,'hint':'这是有限上下文，其他记录使用 search_records 或 get_record 查询。'}
 
     def execute(self, name, args, scheduled=False, actor='user'):
@@ -59,7 +63,7 @@ class Actions:
                 raise ValueError(f'{key} 取值无效')
         if actor=='agent' and name in {t['function']['name'] for t in USER_ACTIONS}:
             raise ValueError('此操作需要用户明确确认，请使用管理面板或快捷命令')
-        if scheduled and name in ('create_schedule','update_schedule','delete_schedule','save_memory','delete_memory','confirm_memory'):
+        if scheduled and name in ('create_schedule','update_schedule','delete_schedule','save_memory','delete_memory','confirm_memory','apply_plan','reject_plan','propose_plan'):
             raise ValueError('定时执行不能修改记忆或管理其他定时任务')
         if name=='get_state':
             return self.context()
