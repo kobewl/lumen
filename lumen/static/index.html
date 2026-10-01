@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Lumen · 个人助手</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
-<body><header><div class="brand"><span class="orb">✦</span><strong>Lumen</strong><span class="version">v0.01</span></div><span id="status">你的个人对话助手</span><button id="access" class="subtle">访问令牌</button></header>
+<body><header><div class="brand"><span class="orb">✦</span><strong>Lumen</strong><span class="version">v0.01.1</span></div><span id="status">你的个人对话助手</span><button id="new-conversation" class="subtle">新对话</button><button id="access" class="subtle">访问令牌</button></header>
 <main><section class="conversation"><div id="messages" aria-live="polite"></div><div id="notice" role="status"></div><form id="chat"><textarea id="input" rows="2" placeholder="和我聊聊，或让我帮你记住、记录、提醒…" aria-label="消息" required maxlength="8000"></textarea><button id="send" type="submit">发送 ↑</button></form><p class="hint">Enter 发送 · Shift + Enter 换行 · 提醒需要服务保持运行</p></section>
 <aside><nav><button class="tab active" data-tab="todos">待办 <span id="todo-count"></span></button><button class="tab" data-tab="memories">记忆</button><button class="tab" data-tab="schedules">定时</button></nav>
 <section class="panel" id="todos"><h2>把事情一件件做好</h2><form id="todo-form" class="inline"><input name="title" placeholder="添加一件待办" aria-label="待办标题" required maxlength="4000"><button>＋</button></form><div id="todo-list"></div></section>

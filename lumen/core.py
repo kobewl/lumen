@@ -30,6 +30,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY, role TEXT NOT NULL, content TEXT NOT NULL,
                 created_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'chat');
@@ -74,9 +76,34 @@ class Store:
             db.execute('INSERT INTO messages VALUES (?,?,?,?,?)',
                        (identifier(), role, content, stamp(), source))
 
+    def context_cutoff(self):
+        rows = self.query("SELECT value FROM settings WHERE key='context_cutoff'")
+        return int(rows[0]['value']) if rows else 0
+
+    def reset_context(self, db, new_conversation=False):
+        cutoff = db.execute('SELECT COALESCE(MAX(rowid),0) FROM messages').fetchone()[0]
+        db.execute("INSERT INTO settings VALUES ('context_cutoff',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(cutoff),))
+        if new_conversation:
+            db.execute("INSERT INTO settings VALUES ('chat_view_cutoff',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(cutoff),))
+
+    def history(self, max_chars=24000):
+        rows = self.query("SELECT role,content FROM messages WHERE source='chat' AND rowid>? ORDER BY rowid DESC LIMIT 30", (self.context_cutoff(),))
+        selected, size = [], 0
+        for row in rows:
+            if size + len(row['content']) > max_chars:
+                break
+            selected.append(row)
+            size += len(row['content'])
+        selected.reverse()
+        while selected and selected[0]['role'] != 'user':
+            selected.pop(0)
+        return selected
+
     def state(self):
+        cutoff = self.query("SELECT value FROM settings WHERE key='chat_view_cutoff'")
+        visible_after = int(cutoff[0]['value']) if cutoff else 0
         return {
-            'messages': list(reversed(self.query('SELECT * FROM messages ORDER BY rowid DESC LIMIT 200'))),
+            'messages': list(reversed(self.query('SELECT * FROM messages WHERE rowid>? ORDER BY rowid DESC LIMIT 200', (visible_after,)))),
             'memories': self.query('SELECT * FROM memories ORDER BY updated_at DESC'),
             'todos': self.query('SELECT * FROM todos ORDER BY done, created_at DESC'),
             'schedules': self.query('SELECT * FROM schedules ORDER BY run_at'),
@@ -95,9 +122,9 @@ def tool(name, description, properties, required=()):
 S = {'type': 'string'}
 TOOLS = [
     tool('get_state', '读取个人记忆、Todo 和定时任务及其真实 ID。', {}),
-    tool('save_memory', '用户明确要求记住个人信息时保存；同一 key 会覆盖旧值。',
-         {'key': S, 'content': S}, ['key', 'content']),
-    tool('delete_memory', '按真实 ID 删除用户要求忘记的信息。', {'id': S}, ['id']),
+    tool('save_memory', '保存用户明确要求记住的个人事实。更正已有事实时必须传真实 id，可更改 key；同一 key 覆盖旧值，不创建同义重复条目。',
+         {'id': S, 'key': S, 'content': S}, ['key', 'content']),
+    tool('delete_memory', '按真实 ID 删除用户要求忘记的信息，同时重置短期模型上下文，避免从旧聊天重新读到。', {'id': S}, ['id']),
     tool('add_todo', '记录待办。due_at 可选，必须是带时区的 ISO8601；截止日期不会自动创建提醒。',
          {'title': S, 'due_at': S}, ['title']),
     tool('update_todo', '修改真实 ID 对应的待办标题或完成状态。',
@@ -153,10 +180,20 @@ class Actions:
         record_id = args.get('id', identifier())
         with self.store.transaction() as db:
             if name == 'save_memory':
-                db.execute('''INSERT INTO memories VALUES (?,?,?,?)
-                    ON CONFLICT(key) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at''',
-                           (record_id, args['key'], args['content'], stamp()))
-                record_id = db.execute('SELECT id FROM memories WHERE key=?', (args['key'],)).fetchone()[0]
+                key, content = args['key'].strip(), args['content'].strip()
+                if 'id' in args:
+                    if not db.execute('SELECT 1 FROM memories WHERE id=?', (record_id,)).fetchone():
+                        raise ValueError('记忆不存在，请先读取真实 ID')
+                    conflict = db.execute('SELECT id FROM memories WHERE key=? AND id!=?', (key, record_id)).fetchone()
+                    if conflict:
+                        raise ValueError('这个名称属于另一条记忆，请先确认要修改哪一条')
+                    db.execute('UPDATE memories SET key=?,content=?,updated_at=? WHERE id=?',
+                               (key, content, stamp(), record_id))
+                else:
+                    db.execute('''INSERT INTO memories VALUES (?,?,?,?)
+                        ON CONFLICT(key) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at''',
+                               (record_id, key, content, stamp()))
+                    record_id = db.execute('SELECT id FROM memories WHERE key=?', (key,)).fetchone()[0]
             elif name == 'add_todo':
                 due = self.date(args['due_at']) if 'due_at' in args else None
                 db.execute('INSERT INTO todos VALUES (?,?,?,0,?)', (record_id, args['title'], due, stamp()))
@@ -173,6 +210,8 @@ class Actions:
                     raise ValueError('任务正在执行，请完成后再修改')
                 if name.startswith('delete_'):
                     db.execute(f'DELETE FROM {table} WHERE id=?', (record_id,))
+                    if name == 'delete_memory':
+                        self.store.reset_context(db)
                 elif name == 'update_todo':
                     if not ('title' in args or 'done' in args):
                         raise ValueError('需要提供 title 或 done')

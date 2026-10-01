@@ -58,6 +58,16 @@ class FeishuTest(unittest.TestCase):
         self.assertIn('休息', self.sent[0][1])
         self.assertEqual(self.store.state()['deliveries'][0]['status'], 'sent')
 
+    def test_new_conversation_command_does_not_call_model(self):
+        self.store.message('user', 'old-topic')
+        self.actions.execute('save_memory', {'key': '风格', 'content': '简洁'})
+        self.bot.handle('new-command', 'owner', 'p2p', 'text', '{"text":"/new"}')
+        self.assertEqual(self.model.inputs, [])
+        self.assertEqual(len(self.store.state()['memories']), 1)
+        self.assertNotIn('old-topic', str(self.store.state()['messages']))
+        self.bot.deliver()
+        self.assertIn('已开始新对话', self.sent[0][1])
+
     def test_sdk_event_adapter(self):
         message=SimpleNamespace(message_id='sdk-m',chat_type='p2p',message_type='text',content=json.dumps({'text':'hi'}))
         event=SimpleNamespace(event=SimpleNamespace(message=message,sender=SimpleNamespace(sender_id=SimpleNamespace(open_id='owner'))))

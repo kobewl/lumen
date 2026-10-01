@@ -76,13 +76,16 @@ def create_server(host, port, store, actions, agent, token=''):
                 if not isinstance(data, dict):
                     raise ValueError('请求必须是 JSON 对象')
                 path = urlparse(self.path).path
+                if path == '/api/conversation/new':
+                    return self.send(200, {'reply': agent.new_conversation()})
                 if path == '/api/chat':
                     text = data.get('message')
                     if not isinstance(text, str) or not text.strip() or len(text) > 8000:
                         raise ValueError('请输入 1–8000 字符的消息')
                     return self.send(200, {'reply': agent.reply(text.strip())})
                 if path == '/api/action':
-                    result = actions.execute(data.get('name'), data.get('args'))
+                    with agent.lock:
+                        result = actions.execute(data.get('name'), data.get('args'))
                     return self.send(200, result)
                 return self.send(404, {'error': '接口不存在'})
             except ModelError as exc:

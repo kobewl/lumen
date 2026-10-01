@@ -155,6 +155,9 @@ class LumenTest(unittest.TestCase):
             self.assertEqual(request('/api/chat', {'message': '你好'})['reply'], '你好')
             self.assertEqual(len(request('/api/state')['messages']), 2)
             self.assertEqual(request('/api/state')['todos'][0]['title'], '读书')
+            self.assertIn('已开始新对话', request('/api/conversation/new', {})['reply'])
+            self.assertEqual(len(request('/api/state')['messages']), 1)
+            self.assertEqual(request('/api/state')['todos'][0]['title'], '读书')
             with urllib.request.urlopen(base) as response:
                 self.assertIn('Lumen'.encode(), response.read())
         finally:
