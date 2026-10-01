@@ -5,9 +5,10 @@ def migrate(db):
     columns = {
         'memories': {'status': "TEXT NOT NULL DEFAULT 'confirmed'", 'category': "TEXT NOT NULL DEFAULT 'personal'",
                      'expires_at': 'TEXT', 'source': "TEXT NOT NULL DEFAULT 'user'"},
+        'feishu_inbox': {'sender':'TEXT','content':'TEXT'},
         'todos': {'priority': "TEXT NOT NULL DEFAULT 'normal'", 'project_id': 'TEXT',
                   'notes': "TEXT NOT NULL DEFAULT ''", 'completed_at': 'TEXT'},
-        'schedules': {'todo_id': 'TEXT', 'month_day': 'INTEGER', 'created_by': "TEXT NOT NULL DEFAULT 'user'"},
+        'schedules': {'todo_id': 'TEXT', 'month_day': 'INTEGER', 'created_by': "TEXT NOT NULL DEFAULT 'user'", 'wall_time':'TEXT', 'zone_name':'TEXT'},
     }
     with db:
         for table, additions in columns.items():

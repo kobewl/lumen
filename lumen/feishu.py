@@ -31,8 +31,10 @@ class Feishu:
         if not text or len(text) > 8000:
             return
         with self.store.transaction() as db:
-            claimed = db.execute('INSERT OR IGNORE INTO feishu_inbox VALUES (?,?,?)',
-                                 (message_id, 'processing', stamp())).rowcount
+            claimed = db.execute('INSERT OR IGNORE INTO feishu_inbox (id,status,created_at,sender,content) VALUES (?,?,?,?,?)',
+                                 (message_id,'processing',stamp(),sender_id,content)).rowcount
+            if not claimed:
+                claimed = db.execute("UPDATE feishu_inbox SET status='processing' WHERE id=? AND status='queued'",(message_id,)).rowcount
         if not claimed:
             return
         try:
@@ -50,6 +52,15 @@ class Feishu:
             message = event.message
             values = (message.message_id, event.sender.sender_id.open_id,
                       message.chat_type, message.message_type, message.content)
+            if values[1]!=self.owner or values[2]!='p2p' or values[3]!='text':
+                return
+            try:
+                text=json.loads(values[4]).get('text')
+                if not isinstance(text,str) or not text.strip() or len(text)>8000:return
+            except (ValueError,AttributeError):return
+            with self.store.transaction() as db:
+                db.execute('INSERT OR IGNORE INTO feishu_inbox (id,status,created_at,sender,content) VALUES (?,?,?,?,?)',
+                           (values[0],'queued',stamp(),values[1],values[4]))
             self.incoming.put_nowait(values)
         except queue.Full:
             logging.error('Feishu incoming queue is full')
@@ -61,6 +72,11 @@ class Feishu:
             try:
                 values = self.incoming.get(timeout=1)
             except queue.Empty:
+                queued=self.store.query("SELECT * FROM feishu_inbox WHERE status='queued' ORDER BY rowid LIMIT 1")
+                if not queued:continue
+                item=queued[0]
+                try:self.handle(item['id'],item['sender'],'p2p','text',item['content'])
+                except Exception:logging.exception('Feishu queued message handling failed')
                 continue
             try:
                 self.handle(*values)
@@ -70,11 +86,20 @@ class Feishu:
                 self.incoming.task_done()
 
     def deliver(self):
-        pending = self.store.query("SELECT * FROM deliveries WHERE status='pending' AND next_at<=? ORDER BY rowid LIMIT 10", (stamp(),))
+        pending = self.store.query("SELECT * FROM deliveries WHERE status='pending' ORDER BY rowid LIMIT 500")
+        blocked=set()
+        attempts=0
         for row in pending:
+            group=row['event_key'].rsplit(':',1)[0]
+            if group in blocked:continue
+            if row['next_at']>stamp():
+                blocked.add(group);continue
+            if attempts>=10 or self.stop.is_set():break
+            attempts+=1
             try:
                 self.sender(row['recipient'], row['content'], row['id'])
             except Exception:
+                blocked.add(group)
                 delay = min(3600, 2 ** min(row['attempts'] + 1, 12))
                 with self.store.transaction() as db:
                     db.execute('UPDATE deliveries SET attempts=attempts+1,next_at=?,last_error=? WHERE id=?',

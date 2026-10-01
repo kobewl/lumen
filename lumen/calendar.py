@@ -2,8 +2,11 @@ from calendar import monthrange
 from datetime import datetime, timedelta, timezone
 
 
-def next_occurrence(value, repeat, zone, after, month_day=None):
+def next_occurrence(value, repeat, zone, after, month_day=None, wall_time=None):
     local = datetime.fromisoformat(value).astimezone(zone)
+    if wall_time:
+        hour,minute,second = [int(part) for part in wall_time.split(':')]
+        local=local.replace(hour=hour,minute=minute,second=second)
     if repeat == 'none':
         return value
     if repeat == 'monthly':

@@ -1,5 +1,5 @@
 """Validated tools and atomic personal-data mutations."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from .core import CATALOG, USER_ACTIONS, identifier, now, stamp
@@ -63,8 +63,11 @@ class Actions:
                 raise ValueError(f'{key} 取值无效')
         if actor=='agent' and name in {t['function']['name'] for t in USER_ACTIONS}:
             raise ValueError('此操作需要用户明确确认，请使用管理面板或快捷命令')
-        if scheduled and name in ('create_schedule','update_schedule','delete_schedule','save_memory','delete_memory','confirm_memory','apply_plan','reject_plan','propose_plan'):
+        if scheduled and name in ('create_schedule','update_schedule','delete_schedule','save_memory','delete_memory','confirm_memory','apply_plan','reject_plan','propose_plan','snooze_schedule'):
             raise ValueError('定时执行不能修改记忆或管理其他定时任务')
+        if name=='get_today':
+            from .briefing import briefing
+            return briefing(self,args.get('mode','today'))
         if name=='get_state':
             return self.context()
         if name=='search_records':
@@ -129,19 +132,40 @@ class Actions:
                     changes.put('schedules',item['id'],{'enabled':0,'todo_id':None})
                 changes.delete('todos',record_id)
             elif name=='create_schedule':
+                run_at=self.date(args['run_at'],future=True)
+                local=datetime.fromisoformat(run_at).astimezone(self.zone)
+                if args['repeat']=='weekdays':
+                    while local.weekday()>=5: local+=timedelta(days=1)
+                    run_at=stamp(local.astimezone(timezone.utc))
+                if args['kind']=='briefing' and args['prompt'] not in ('today','weekly'):
+                    raise ValueError('简报任务 prompt 必须为 today 或 weekly')
                 changes.put('schedules',record_id,{'title':args['title'],'prompt':args['prompt'],'kind':args['kind'],
-                    'run_at':self.date(args['run_at'],future=True),'repeat':args['repeat'],'created_at':stamp()})
-            elif name in ('delete_schedule','update_schedule'):
+                    'run_at':run_at,'repeat':args['repeat'],'created_at':stamp(),'month_day':local.day,'wall_time':local.strftime('%H:%M:%S'),'zone_name':self.zone.key})
+            elif name in ('delete_schedule','update_schedule','snooze_schedule'):
                 row = require(db,'schedules',record_id)
                 if row['status']=='running':
                     raise ValueError('任务正在执行，请完成后再修改')
                 if name=='delete_schedule':
                     changes.delete('schedules',record_id)
+                elif name=='snooze_schedule':
+                    changes.put('schedules',record_id,{'run_at':stamp(now()+timedelta(minutes=args['minutes'])),'enabled':1,'status':'pending','last_error':None})
                 else:
-                    if args['enabled'] and not args.get('run_at'):
-                        raise ValueError('重新启用任务需要提供未来 run_at')
-                    run_at = self.date(args['run_at'],future=True) if args['enabled'] else row['run_at']
-                    changes.put('schedules',record_id,{'enabled':int(args['enabled']),'run_at':run_at,'status':'pending','last_error':None})
+                    if len(args)==1:
+                        raise ValueError('需要提供修改字段')
+                    enabled=int(args.get('enabled',row['enabled']))
+                    run_at=self.date(args['run_at'],future=True) if 'run_at' in args else row['run_at']
+                    if enabled and datetime.fromisoformat(run_at)<=now():
+                        raise ValueError('启用已过期任务需要提供未来 run_at')
+                    values={key:args[key] for key in ('title','prompt','repeat','kind') if key in args}
+                    if args.get('kind',row['kind'])=='briefing' and args.get('prompt',row['prompt']) not in ('today','weekly'):
+                        raise ValueError('简报任务 prompt 必须为 today 或 weekly')
+                    if 'run_at' in args:
+                        local=datetime.fromisoformat(run_at).astimezone(self.zone)
+                        values.update(month_day=local.day,wall_time=local.strftime('%H:%M:%S'),zone_name=self.zone.key)
+                    if 'run_at' in args or 'enabled' in args:
+                        values.update(enabled=enabled,run_at=run_at,status='pending',last_error=None)
+                    changes.put('schedules',record_id,values)
+
             else:
                 record_id = execute(self,db,changes,name,args,record_id)
             receipt = changes.finish(name,record_id,actor)
