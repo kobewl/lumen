@@ -18,6 +18,11 @@ DOMAIN_TOOLS = [
     tool('delete_project', '删除项目并解除任务归属，任务保留。', {'id': S}, ['id']),
 ]
 USER_ACTIONS = [tool('undo_change','用户撤销一项事务操作，id 可选默认最近操作。',{'id':S}),tool('retry_delivery','用户重试飞书发送。',{'id':S},['id']),tool('confirm_memory', '用户确认候选记忆。', {'id': S}, ['id']),
+    tool('accept_revision','用户采纳捕获器对已有记忆提出的修改。',{'id':S},['id']),
+    tool('dismiss_revision','用户忽略捕获器对已有记忆提出的修改。',{'id':S},['id']),
+    tool('set_memory_policy','用户设置某个记忆目录的写入权限。auto 直接生效，confirm 需要用户确认。',
+         {'catalog':{'type':'string','enum':['soul','daily']},'operation':{'type':'string','enum':['capture','revise']},'mode':{'type':'string','enum':['auto','confirm']}},
+         ['catalog','operation','mode']),
     tool('apply_plan','用户确认计划并创建项目和任务。',{'id':S},['id']),
     tool('reject_plan','用户取消待确认计划。',{'id':S},['id'])]
 
@@ -133,6 +138,26 @@ def execute(actions, db, changes, name, args, record_id):
         if row['expires_at'] and row['expires_at'] <= stamp():
             raise ValueError('记忆已过期，请先更新有效期')
         changes.put('memories', record_id, {'status': 'confirmed', 'updated_at': stamp()})
+    elif name == 'accept_revision':
+        row = require(db, 'memories', record_id)
+        if not row.get('proposed_content'):
+            raise ValueError('没有待采纳的修改')
+        new_key = (row.get('proposed_key') or row['key']).strip()
+        if db.execute('SELECT id FROM memories WHERE key=? AND id!=?', (new_key, record_id)).fetchone():
+            raise ValueError('这个名称属于另一条记忆，请先确认要修改哪一条')
+        expires_at = row.get('proposed_expires_at') or row.get('expires_at')
+        if expires_at and expires_at <= stamp():
+            raise ValueError('建议里的有效期已经过去，请忽略这条修改或手动更新有效期')
+        changes.put('memories', record_id, {'key': new_key, 'content': row['proposed_content'],
+            'catalog': row.get('proposed_catalog') or row.get('catalog') or 'soul', 'expires_at': expires_at,
+            'proposed_content': None, 'proposed_key': None, 'proposed_catalog': None, 'proposed_expires_at': None,
+            'status': 'confirmed', 'updated_at': stamp()})
+    elif name == 'dismiss_revision':
+        row = require(db, 'memories', record_id)
+        if not row.get('proposed_content'):
+            raise ValueError('没有待忽略的修改')
+        changes.put('memories', record_id, {'proposed_content': None, 'proposed_key': None,
+            'proposed_catalog': None, 'proposed_expires_at': None, 'updated_at': stamp()})
     else:
         raise ValueError('未知工具')
     return record_id

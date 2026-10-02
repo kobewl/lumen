@@ -108,13 +108,14 @@ class Store:
             'notes': self.query('SELECT * FROM notes ORDER BY updated_at DESC'),
             'projects': self.query('SELECT * FROM projects ORDER BY created_at DESC'),
             'plans': self.query('SELECT * FROM plans ORDER BY created_at DESC'),
+            'policies': self.query('SELECT id,catalog,operation,mode FROM memory_policies ORDER BY catalog,operation'),
         }
 
 
 TOOLS = [
     tool('get_state', '读取个人记忆、Todo 和定时任务及其真实 ID。', {}),
-    tool('save_memory', '保存用户明确要求记住的个人事实。更正已有事实时必须传真实 id，可更改 key；同一 key 覆盖旧值，不创建同义重复条目。',
-         {'id': S, 'key': S, 'content': S, 'category': {'type':'string','enum':['personal','preference','work','temporary']}, 'status': {'type':'string','enum':['confirmed','pending']}, 'expires_at': {'type':'string','minLength':0}}, ['key', 'content']),
+    tool('save_memory', '保存用户明确要求记住或更正的事实。catalog=soul 是个人 Soul（称呼、价值观、稳定偏好），catalog=daily 是日常（行程、近况、临时状态）。更正已有事实时必须传真实 id；同一 key 覆盖旧值。随口事实由捕获器处理，不要重复保存。',
+         {'id': S, 'key': S, 'content': S, 'catalog': {'type':'string','enum':['soul','daily']}, 'category': {'type':'string','enum':['personal','preference','work','temporary']}, 'status': {'type':'string','enum':['confirmed','pending']}, 'expires_at': {'type':'string','minLength':0}}, ['key', 'content']),
     tool('delete_memory', '按真实 ID 删除用户要求忘记的信息，同时重置短期模型上下文，避免从旧聊天重新读到。', {'id': S}, ['id']),
     tool('add_todo', '记录待办。due_at 可选，必须是带时区的 ISO8601；截止日期不会自动创建提醒。',
          {'title': S, 'due_at': {'type':'string','minLength':0}, 'priority': {'type':'string','enum':['high','normal','low']}, 'project_id': {'type':'string','minLength':0}, 'notes': {'type':'string','minLength':0}, 'remind_at': S}, ['title']),

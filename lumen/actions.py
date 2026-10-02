@@ -28,7 +28,7 @@ class Actions:
                     db.execute("UPDATE memories SET status='expired' WHERE id=?", (item['id'],))
                 self.store.reset_context(db)
                 expired_changes.finish('expire_memory',expired[0]['id'],'system')
-        memories = self.store.query("SELECT * FROM memories WHERE status='confirmed' AND (expires_at IS NULL OR expires_at>?) ORDER BY updated_at DESC LIMIT 40", (stamp(),))
+        memories = self.store.query("SELECT * FROM memories WHERE status='confirmed' AND (expires_at IS NULL OR expires_at>?) ORDER BY CASE catalog WHEN 'soul' THEN 0 ELSE 1 END, updated_at DESC LIMIT 40", (stamp(),))
         todos = self.store.query("SELECT * FROM todos WHERE done=0 ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,due_at IS NULL,due_at,created_at DESC LIMIT 30")
         schedules = self.store.query("SELECT * FROM schedules WHERE enabled=1 ORDER BY run_at LIMIT 15")
         notes = self.store.query('SELECT id,title,tags,updated_at FROM notes ORDER BY updated_at DESC LIMIT 15')
@@ -43,8 +43,19 @@ class Actions:
         for item in plans:
             import json
             item['steps'] = [step[:120] for step in json.loads(item['steps'])]
-        return {'plans':plans,'memories':memories,'todos':todos,'schedules':schedules,'notes':notes,'projects':projects,
-                'counts':counts,'hint':'这是有限上下文，其他记录使用 search_records 或 get_record 查询。'}
+        revisions = []
+        for row in memories:
+            if row.get('proposed_content'):
+                revisions.append({'id': row['id'], 'catalog': row.get('catalog'), 'key': row['key'],
+                                  'proposed_key': row.get('proposed_key'), 'proposed_content': row['proposed_content'][:400],
+                                  'proposed_catalog': row.get('proposed_catalog'), 'proposed_expires_at': row.get('proposed_expires_at')})
+            for field in ('proposed_content', 'proposed_key', 'proposed_catalog', 'proposed_expires_at'):
+                row.pop(field, None)
+        pending = self.store.query("SELECT id,catalog,key FROM memories WHERE status='pending' ORDER BY updated_at DESC LIMIT 8")
+        policies = self.store.query('SELECT catalog,operation,mode FROM memory_policies ORDER BY catalog,operation')
+        return {'plans':plans,'memories':memories,'pending_memories':pending,'pending_revisions':revisions,
+                'memory_policy':policies,'todos':todos,'schedules':schedules,'notes':notes,'projects':projects,
+                'counts':counts,'hint':'memories 才是已生效事实，按 catalog 分为 soul 与 daily。pending_memories 和 pending_revisions 还没有生效。'}
 
     def execute(self, name, args, scheduled=False, actor='user'):
         if not isinstance(name,str) or name not in CATALOG or not isinstance(args,dict):
@@ -68,6 +79,15 @@ class Actions:
             raise ValueError('此操作需要用户明确确认，请使用管理面板或快捷命令')
         if scheduled and name in ('create_schedule','update_schedule','delete_schedule','save_memory','delete_memory','confirm_memory','apply_plan','reject_plan','propose_plan','snooze_schedule'):
             raise ValueError('定时执行不能修改记忆或管理其他定时任务')
+        if name=='set_memory_policy':
+            with self.store.transaction() as db:
+                row = db.execute('SELECT * FROM memory_policies WHERE catalog=? AND operation=?', (args['catalog'], args['operation'])).fetchone()
+                if row is None:
+                    raise ValueError('未知的记忆权限')
+                changes = Changes(db)
+                changes.put('memory_policies', row['id'], {'mode': args['mode']})
+                receipt = changes.finish(name, row['id'], actor)
+            return {'ok': True, 'id': row['id'], 'action': name, 'receipt_id': receipt, 'catalog': args['catalog'], 'operation': args['operation'], 'mode': args['mode']}
         if name=='undo_change':
             from .operations import undo
             return undo(self,args.get('id'))
@@ -94,22 +114,11 @@ class Actions:
                 raise ValueError('记忆未确认或已过期')
             return row
         record_id = args.get('id',identifier())
+        extra = {}
         with self.store.transaction() as db:
             changes = Changes(db)
             if name=='save_memory':
-                key = args['key'].strip()
-                row = require(db,'memories',record_id) if 'id' in args else db.execute('SELECT * FROM memories WHERE key=?',(key,)).fetchone()
-                row = dict(row) if row else {}
-                if row:
-                    record_id = row['id']
-                if db.execute('SELECT id FROM memories WHERE key=? AND id!=?',(key,record_id)).fetchone():
-                    raise ValueError('这个名称属于另一条记忆，请先确认要修改哪一条')
-                if actor=='agent' and row.get('status')=='confirmed' and args.get('status')=='pending':
-                    raise ValueError('已有确认记忆；候选更正请先询问用户，不覆盖原事实')
-                expiry = self.date(args['expires_at'],future=True) if args.get('expires_at') else (None if 'expires_at' in args else None if row.get('status')=='expired' else row.get('expires_at'))
-                changes.put('memories',record_id,{'key':key,'content':args['content'].strip(),'updated_at':stamp(),
-                    'category':args.get('category',row.get('category','personal')),'status':args.get('status','confirmed' if row.get('status')=='expired' else row.get('status','confirmed')),
-                    'expires_at':expiry,'source':actor})
+                record_id, extra = self._save_memory(db, changes, args, record_id, actor)
             elif name=='delete_memory':
                 require(db,'memories',record_id)
                 changes.delete('memories',record_id)
@@ -183,4 +192,75 @@ class Actions:
             else:
                 record_id = execute(self,db,changes,name,args,record_id)
             receipt = changes.finish(name,record_id,actor)
-        return {'ok':True,'id':record_id,'action':name,'receipt_id':receipt}
+        result = {'ok':True,'id':record_id,'action':name,'receipt_id':receipt}
+        result.update(extra)
+        return result
+
+    def _save_memory(self, db, changes, args, record_id, actor):
+        from .policy import catalog_for, grant
+        key = args['key'].strip()
+        content = args['content'].strip()
+        row = require(db,'memories',record_id) if 'id' in args else db.execute('SELECT * FROM memories WHERE key=?',(key,)).fetchone()
+        row = dict(row) if row else {}
+        if row:
+            record_id = row['id']
+        if row.get('status')=='confirmed' and row.get('expires_at') and row['expires_at']<=stamp():
+            row['status'] = 'expired'  # Lapsed but not swept yet; treat it as already gone.
+        if db.execute('SELECT id FROM memories WHERE key=? AND id!=?',(key,record_id)).fetchone():
+            raise ValueError('这个名称属于另一条记忆，请先确认要修改哪一条')
+        if actor=='agent' and row.get('status')=='confirmed' and args.get('status')=='pending':
+            raise ValueError('已有确认记忆；候选更正请先询问用户，不覆盖原事实')
+        catalog = catalog_for(args, row)
+        expiry = self.date(args['expires_at'],future=True) if args.get('expires_at') else (None if 'expires_at' in args else None if row.get('status')=='expired' else row.get('expires_at'))
+        if 'category' in args:
+            category = args['category']
+        elif row.get('category'):
+            category = row['category']
+        elif catalog=='daily':
+            category = 'temporary' if expiry else 'work'
+        else:
+            category = 'personal'
+        # A new period only counts when the speaker actually gave one; revived facts are never "unchanged".
+        new_expiry = expiry if args.get('expires_at') else None
+        changed = bool(row) and (row.get('content')!=content or row.get('key')!=key or row.get('catalog')!=catalog
+                                 or (new_expiry is not None and new_expiry!=row.get('expires_at'))
+                                 or row.get('status')=='expired')
+        write_key, write_content, write_catalog = key, content, catalog
+        proposed_content = proposed_key = proposed_catalog = proposed_expires_at = None
+        status = args.get('status', 'confirmed' if row.get('status')=='expired' else row.get('status','confirmed'))
+        effect = 'stored'
+        if actor=='capture':
+            operation = 'revise' if row.get('status')=='confirmed' and changed else 'capture'
+            if row and not changed:
+                return record_id, {'effect':'unchanged','catalog':row.get('catalog'),'status':row.get('status')}
+            governed = row.get('catalog') if operation=='revise' and row.get('catalog') else catalog
+            if grant(self.store, governed, operation)=='confirm' and operation=='revise':
+                write_key, write_content, write_catalog = row['key'], row['content'], row.get('catalog') or catalog
+                category, status, expiry = row.get('category', category), row['status'], row.get('expires_at')
+                proposed_content, proposed_key = content, key
+                proposed_catalog, proposed_expires_at = catalog, new_expiry
+                effect = 'proposed'
+            elif grant(self.store, catalog, 'capture')=='confirm' and operation=='capture':
+                status, effect = 'pending', 'pending'
+            else:
+                status, effect = 'confirmed', 'stored'
+        elif actor=='agent':
+            if (not row or row.get('status')!='confirmed') and (args.get('status')=='pending' or grant(self.store, catalog, 'capture')=='confirm'):
+                status, effect = 'pending', 'pending'
+            elif args.get('status')=='pending':
+                status, effect = 'pending', 'pending'
+            else:
+                status, effect = 'confirmed', 'stored'
+        elif args.get('status')=='pending':
+            status, effect = 'pending', 'pending'
+        else:
+            status = 'confirmed' if row.get('status')=='expired' or 'status' not in args else args.get('status', status)
+            if status!='pending':
+                status, effect = 'confirmed', 'stored'
+        if effect=='unchanged':
+            return record_id, {'effect':effect,'catalog':write_catalog,'status':status}
+        changes.put('memories',record_id,{'key':write_key,'content':write_content,'updated_at':stamp(),
+            'category':category,'status':status,'expires_at':expiry,'source':actor,'catalog':write_catalog,
+            'proposed_content':proposed_content,'proposed_key':proposed_key,
+            'proposed_catalog':proposed_catalog,'proposed_expires_at':proposed_expires_at})
+        return record_id, {'effect':effect,'catalog':write_catalog,'status':status}

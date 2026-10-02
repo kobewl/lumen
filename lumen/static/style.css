@@ -3,4 +3,5 @@
 
 nav{flex-wrap:wrap}nav button{flex:1 0 26%}.filters{margin:12px 0}.card>button{margin:5px 5px 0 0}
 
+.policy{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #e6ebe3;font-size:12px}.policy button{width:auto;font-size:11px;padding:5px 8px}
 .briefing{white-space:pre-wrap;line-height:1.85;background:#edf3e8;border-radius:12px;padding:16px;margin-top:0}#activity-list{max-height:460px;overflow:auto}#task-detail-form{padding:12px;background:#f0f4ed;border-radius:12px}.message pre{overflow:auto;white-space:pre-wrap;background:#f1f4ee;border-radius:8px;padding:12px}
