@@ -34,6 +34,9 @@ def undo(actions, record_id=None):
         entries=json.loads(row['changes'])
         for entry in entries:
             if entry['table'] not in RECOVERABLE:raise ValueError('操作记录不支持恢复')
+            if entry['table']=='memories' and entry['before'] is not None:
+                from .privacy import blocked_memory
+                if blocked_memory(entry['before']):raise ValueError('撤销会恢复敏感记忆，已拒绝；请直接修改当前记录')
             current=db.execute(f'SELECT * FROM {entry["table"]} WHERE id=?',(entry['id'],)).fetchone()
             if (dict(current) if current else None)!=entry['after']:
                 raise ValueError('记录已经被后续操作或执行改变，无法安全撤销；请直接修改当前记录')

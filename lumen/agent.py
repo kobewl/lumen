@@ -10,6 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .core import TOOLS
+from .privacy import sanitize
 
 
 class ModelError(RuntimeError):
@@ -34,7 +35,7 @@ class Model:
 
     def _request(self, body):
         self._budget()
-        payload = json.dumps(body, ensure_ascii=False).encode()
+        payload = json.dumps(sanitize(body), ensure_ascii=False).encode()
         request = urllib.request.Request(self.base + '/chat/completions', data=payload,
                                          headers={'Content-Type': 'application/json',
                                                   'Authorization': 'Bearer ' + self.key})
@@ -177,6 +178,7 @@ class Agent:
 只把 memories 里已确认且未过期的内容当作个人事实。pending_memories 和 pending_revisions 还没生效。
 个人状态是有限摘要，记录数量多时用 search_records 搜索，再用 get_record 读取真实记录；回答笔记内容时给出实际标题，不编造出处。
 必须通过工具完成写入，只有工具返回 ok=true 才能说已完成。用真实 ID，不能编造。
+密码、验证码、密钥、证件号、银行卡号不能保存为记忆。看到「[敏感信息已拦截]」时解释本地已拦截，不猜测或追问被隐藏的值。
 记忆目录：soul 是个人 Soul（称呼、价值观、稳定偏好、长期喜恶），daily 是日常（行程、近况、临时状态）。
 回答前，独立捕获器已经按权限表处理过这句话。effect=stored 的条目已经生效，不要再用 save_memory 写同一事实。effect=pending 需要用户 /remember。effect=proposed 是对已有事实的修改建议，原事实仍然有效，请告诉用户发送 /accept ID。
 记忆规则：
@@ -250,7 +252,7 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
                 count = 0
                 for _ in range(8):
                     if time.monotonic()-started>120:raise ModelError('本轮处理超时，请将请求分成更小的任务')
-                    message = self.model.complete(messages)
+                    message = self.model.complete(sanitize(messages))
                     calls = message.get('tool_calls') or []
                     if not calls:
                         answer = message.get('content')

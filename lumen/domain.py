@@ -1,6 +1,7 @@
 """Personal records, validation, and transactional change receipts."""
 import json
 from .contracts import S, identifier, stamp, tool
+from .privacy import blocked_memory, require_safe_memory
 
 EMPTY = {'type': 'string', 'minLength': 0}
 TABLES = {'memory': 'memories', 'todo': 'todos', 'note': 'notes', 'project': 'projects', 'schedule': 'schedules', 'plan':'plans'}
@@ -85,6 +86,8 @@ def search(actions, query, scope='all'):
             where = '(' + where + ") AND status='confirmed' AND (expires_at IS NULL OR expires_at>?)"
             params.append(stamp())
         rows = actions.store.query(f'SELECT * FROM {table} WHERE {where} ORDER BY rowid DESC LIMIT 20', params)
+        if table=='memories':
+            rows = [row for row in rows if not blocked_memory(row)]
         results.extend({'type': table, **row} for row in rows)
     for record in results:
         for key in ('content','notes','goal','steps'):
@@ -135,6 +138,7 @@ def execute(actions, db, changes, name, args, record_id):
         changes.delete('projects', record_id)
     elif name == 'confirm_memory':
         row = require(db, 'memories', record_id)
+        require_safe_memory(row['key'], row['content'])
         if row['expires_at'] and row['expires_at'] <= stamp():
             raise ValueError('记忆已过期，请先更新有效期')
         changes.put('memories', record_id, {'status': 'confirmed', 'updated_at': stamp()})
@@ -143,6 +147,7 @@ def execute(actions, db, changes, name, args, record_id):
         if not row.get('proposed_content'):
             raise ValueError('没有待采纳的修改')
         new_key = (row.get('proposed_key') or row['key']).strip()
+        require_safe_memory(new_key, row['proposed_content'])
         if db.execute('SELECT id FROM memories WHERE key=? AND id!=?', (new_key, record_id)).fetchone():
             raise ValueError('这个名称属于另一条记忆，请先确认要修改哪一条')
         expires_at = row.get('proposed_expires_at') or row.get('expires_at')

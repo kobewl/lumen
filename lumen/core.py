@@ -96,11 +96,12 @@ class Store:
         return selected
 
     def state(self):
+        from .privacy import blocked_memory
         cutoff = self.query("SELECT value FROM settings WHERE key='chat_view_cutoff'")
         visible_after = int(cutoff[0]['value']) if cutoff else 0
         return {
             'messages': list(reversed(self.query('SELECT * FROM messages WHERE rowid>? ORDER BY rowid DESC LIMIT 200', (visible_after,)))),
-            'memories': self.query('SELECT * FROM memories ORDER BY updated_at DESC'),
+            'memories': [{**row,'sensitive_blocked':blocked_memory(row)} for row in self.query('SELECT * FROM memories ORDER BY updated_at DESC')],
             'todos': self.query('SELECT * FROM todos ORDER BY done, created_at DESC'),
             'schedules': self.query('SELECT * FROM schedules ORDER BY run_at'),
             'deliveries': self.query('SELECT id,status,attempts,last_error FROM deliveries ORDER BY rowid DESC LIMIT 30'),

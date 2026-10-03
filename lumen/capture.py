@@ -1,6 +1,7 @@
 """Small classifier that files facts into soul or daily before the chat model answers."""
 import json
 import logging
+from .privacy import reasons, blocked_memory
 
 PROMPT = '''你是记忆捕获器，不是聊天助手。只根据用户这一句话抽取值得记住的事实，输出 JSON：{"items":[{"catalog":"soul","key":"短名称","content":"一个事实","expires_at":""}]}
 目录：
@@ -9,6 +10,7 @@ PROMPT = '''你是记忆捕获器，不是聊天助手。只根据用户这一�
 规则：
 - 没有这类事实就返回 {"items":[]}。
 - 不记录待办、提醒、计划步骤、对助手的一次性要求、寒暄和猜测。
+- 绝不记录密码、验证码、密钥、证件号码或银行卡号，即使用户要求记住。
 - 同一事实沿用已有 key，不要新建近义名称。
 - expires_at 只在用户说出明确期限时填写带时区的 ISO8601，否则用空字符串。
 - 最多 4 条。key 不超过 40 字，content 不超过 400 字。'''
@@ -47,17 +49,17 @@ def parse_items(raw):
 
 def file_utterance(model, actions, text):
     classify = getattr(model, 'classify', None)
-    if not callable(classify) or not text or text.startswith('/'):
+    if not callable(classify) or not text or text.startswith('/') or reasons(text):
         return []
     try:
         from .contracts import stamp
         memories = actions.store.query(
             "SELECT catalog,key,content FROM memories WHERE status='confirmed' AND (expires_at IS NULL OR expires_at>?) ORDER BY updated_at DESC LIMIT 30",
             (stamp(),))
-        raw = classify(text, memories)
+        raw = classify(text, [item for item in memories if not blocked_memory(item)])
         items = parse_items(raw)
     except Exception:
-        logging.exception('memory capture skipped')
+        logging.warning('memory capture skipped after classifier failure')
         return []
     filed = []
     for item in items:

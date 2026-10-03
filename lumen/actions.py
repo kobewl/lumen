@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 from .core import CATALOG, USER_ACTIONS, identifier, now, stamp
 from .domain import Changes, TABLES, execute, require, search
+from .privacy import blocked_memory, require_safe_memory
 
 
 class Actions:
@@ -29,6 +30,7 @@ class Actions:
                 self.store.reset_context(db)
                 expired_changes.finish('expire_memory',expired[0]['id'],'system')
         memories = self.store.query("SELECT * FROM memories WHERE status='confirmed' AND (expires_at IS NULL OR expires_at>?) ORDER BY CASE catalog WHEN 'soul' THEN 0 ELSE 1 END, updated_at DESC LIMIT 40", (stamp(),))
+        memories = [row for row in memories if not blocked_memory(row)]
         todos = self.store.query("SELECT * FROM todos WHERE done=0 ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,due_at IS NULL,due_at,created_at DESC LIMIT 30")
         schedules = self.store.query("SELECT * FROM schedules WHERE enabled=1 ORDER BY run_at LIMIT 15")
         notes = self.store.query('SELECT id,title,tags,updated_at FROM notes ORDER BY updated_at DESC LIMIT 15')
@@ -51,7 +53,7 @@ class Actions:
                                   'proposed_catalog': row.get('proposed_catalog'), 'proposed_expires_at': row.get('proposed_expires_at')})
             for field in ('proposed_content', 'proposed_key', 'proposed_catalog', 'proposed_expires_at'):
                 row.pop(field, None)
-        pending = self.store.query("SELECT id,catalog,key FROM memories WHERE status='pending' ORDER BY updated_at DESC LIMIT 8")
+        pending = [{'id':row['id'],'catalog':row['catalog'],'key':row['key']} for row in self.store.query("SELECT * FROM memories WHERE status='pending' ORDER BY updated_at DESC LIMIT 8") if not blocked_memory(row)]
         policies = self.store.query('SELECT catalog,operation,mode FROM memory_policies ORDER BY catalog,operation')
         return {'plans':plans,'memories':memories,'pending_memories':pending,'pending_revisions':revisions,
                 'memory_policy':policies,'todos':todos,'schedules':schedules,'notes':notes,'projects':projects,
@@ -112,6 +114,8 @@ class Actions:
                 row = require(db,table,args['id'])
             if table=='memories' and (row['status']!='confirmed' or (row['expires_at'] and row['expires_at']<=stamp())):
                 raise ValueError('记忆未确认或已过期')
+            if table=='memories' and blocked_memory(row):
+                raise ValueError('敏感记忆已停止向模型提供，请在个人面板修改或删除')
             return row
         record_id = args.get('id',identifier())
         extra = {}
@@ -200,6 +204,7 @@ class Actions:
         from .policy import catalog_for, grant
         key = args['key'].strip()
         content = args['content'].strip()
+        require_safe_memory(key, content)
         row = require(db,'memories',record_id) if 'id' in args else db.execute('SELECT * FROM memories WHERE key=?',(key,)).fetchone()
         row = dict(row) if row else {}
         if row:
