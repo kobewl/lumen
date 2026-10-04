@@ -1,5 +1,23 @@
 # 部署与恢复
 
+## 一行安装与更新
+
+适用 Linux / macOS，预先安装 Git、curl、Python 3.11+ 及 venv 支持。在现有仓库目录执行，或首次安装到默认 `~/lumen`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kobewl/lumen/main/scripts/install.sh | bash
+```
+
+已有 `/opt/lumen` 和 `lumen.service` 的部署，使用同一条命令更新并重启原本运行的服务：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kobewl/lumen/main/scripts/install.sh | sudo env LUMEN_INSTALL_DIR=/opt/lumen LUMEN_SERVICE=lumen bash
+```
+
+也可先下载脚本检查，再运行。`LUMEN_INSTALL_DIR` 指定仓库目录，`LUMEN_PYTHON` 指定 Python。脚本验证仓库来源、拒绝未提交改动、仅允许快进更新，先准备新的独立虚拟环境，再备份和切换；配置文件不加载、不打印、不覆盖。首次安装需要自行注入凭据并配置服务，本脚本不安装系统软件包或自动创建 systemd 服务。
+
+备份覆盖仓库 `data/*.db`、`/opt/lumen` 部署的标准 `/var/lib/lumen/lumen-v001.db` 和显式 `LUMEN_DB_PATH`。自定义数据库路径请通过该变量传入；脚本不会读取 systemd 配置里的秘密来猜测路径。指定服务时先核对工作目录，切换前停服务，成功后恢复原先运行状态；失败会报错，已停止的服务不会盲目启动，需检查后处理。旧虚拟环境与升级备份保留，不自动清理。更新有独占锁；异常强制中断后，确认没有更新进程，再移除仓库中的 `.lumen-install.lock` 空目录。
+
 ## 本机运行与升级
 
 Python 3.11+，在仓库根目录安装 `requirements.txt`，将本地配置注入进程，执行 `python3 -m lumen`。飞书 SDK 是唯一需要安装的一组渠道依赖，模型推理由远端 API 完成。

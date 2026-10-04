@@ -25,6 +25,14 @@ v1.1 是完整的**单用户个人事务助手**，文本渠道以飞书和网�
 
 Python 3.11+，无需 Go、Node、Redis、向量数据库或本地模型。
 
+已有 Python 3.11+、Git 和 curl 的 Linux / macOS 主机，可以用同一条命令首次安装或更新最新代码：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kobewl/lumen/main/scripts/install.sh | bash
+```
+
+在现有仓库目录执行会更新该目录；其他目录执行默认安装到 `~/lumen`。配置与个人数据保留，先备份数据库并准备依赖，再更新代码。已有 systemd 部署的自动重启命令和自定义路径见 [部署说明](deploy/README.md#一行安装与更新)。首次安装仍需配置模型和飞书凭据。
+
 ```bash
 python3 -m pip install -r requirements.txt
 export LUMEN_MODEL_API_KEY='你的模型密钥'

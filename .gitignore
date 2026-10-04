@@ -69,3 +69,8 @@ build/
 *.swp
 *.swo
 *~
+
+# Installer-managed environments and atomic switch
+.venvs/
+.venv-next
+.lumen-install.lock/
