@@ -2,6 +2,7 @@
 import json
 import logging
 from .privacy import reasons, blocked_memory
+from .capture_gate import screen,claim,record,finish
 
 PROMPT = '''你是记忆捕获器，不是聊天助手。只根据用户这一句话抽取值得记住的事实，输出 JSON：{"items":[{"catalog":"soul","key":"短名称","content":"一个事实","expires_at":""}]}
 目录：
@@ -36,7 +37,9 @@ def parse_items(raw):
         catalog, key, content = item.get('catalog'), item.get('key'), item.get('content')
         if catalog not in ('soul', 'daily') or not isinstance(key, str) or not isinstance(content, str):
             continue
-        key, content = key.strip()[:40], content.strip()[:400]
+        key, content = key.strip(), content.strip()
+        if len(key)>40 or len(content)>400:
+            continue
         if not key or not content:
             continue
         args = {'catalog': catalog, 'key': key, 'content': content}
@@ -49,8 +52,17 @@ def parse_items(raw):
 
 def file_utterance(model, actions, text):
     classify = getattr(model, 'classify', None)
-    if not callable(classify) or not text or text.startswith('/') or reasons(text):
+    if not callable(classify):
         return []
+    decision=screen(text)
+    if decision!='candidate':
+        record(actions.store,decision)
+        return []
+    if hasattr(model,'key') and not model.key:
+        record(actions.store,'no_model')
+        return []
+    event_id,decision=claim(actions.store,actions.zone)
+    if decision!='started':return []
     try:
         from .contracts import stamp
         memories = actions.store.query(
@@ -58,7 +70,9 @@ def file_utterance(model, actions, text):
             (stamp(),))
         raw = classify(text, [item for item in memories if not blocked_memory(item)])
         items = parse_items(raw)
+        finish(actions.store,event_id,'classified' if items else 'empty_result')
     except Exception:
+        finish(actions.store,event_id,'classifier_error')
         logging.warning('memory capture skipped after classifier failure')
         return []
     filed = []

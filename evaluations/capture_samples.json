@@ -1,0 +1,518 @@
+{
+  "format": "lumen-capture-evaluation-v1",
+  "synthetic": true,
+  "samples": [
+    {
+      "id": "capture-001",
+      "text": "我讨厌香菜",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "香菜"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-002",
+      "text": "我喜欢少糖饮料",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "少糖"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-003",
+      "text": "我的名字是小林",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "小林"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-004",
+      "text": "我叫阿明",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "阿明"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-005",
+      "text": "我喜欢简洁直接的回答",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "简洁"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-006",
+      "text": "我不吃海鲜",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "海鲜"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-007",
+      "text": "我平时不喝咖啡",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "咖啡"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-008",
+      "text": "我来自成都",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "成都"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-009",
+      "text": "我习惯晚上学习",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "晚上"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-010",
+      "text": "我更喜欢用中文交流",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "中文"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-011",
+      "text": "I prefer concise answers",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "concise"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-012",
+      "text": "I hate cilantro",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "cilantro"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-013",
+      "text": "My name is Lin",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "Lin"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-014",
+      "text": "我现在在上海出差",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "上海"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-015",
+      "text": "我最近在学数据库",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "数据库"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-016",
+      "text": "我目前在准备面试",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "面试"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-017",
+      "text": "我这周住杭州",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "杭州"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-018",
+      "text": "我还在北京",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "北京"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-019",
+      "text": "我最近每天跑步",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "跑步"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-020",
+      "text": "I am in Tokyo for a work trip",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "Tokyo"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-021",
+      "text": "My schedule this week includes a conference",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "conference"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-022",
+      "text": "我在上海出差，而且我讨厌香菜",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "上海"
+          ]
+        },
+        {
+          "catalog": "soul",
+          "contains": [
+            "香菜"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-023",
+      "text": "我现在在杭州",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "杭州"
+          ]
+        }
+      ],
+      "memories": [
+        {
+          "catalog": "daily",
+          "key": "所在地",
+          "content": "上海"
+        }
+      ],
+      "expected_key": "所在地"
+    },
+    {
+      "id": "capture-024",
+      "text": "我喜欢吃辣",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "辣"
+          ]
+        }
+      ],
+      "memories": [
+        {
+          "catalog": "soul",
+          "key": "口味",
+          "content": "不吃辣"
+        }
+      ],
+      "expected_key": "口味"
+    },
+    {
+      "id": "capture-025",
+      "text": "我叫阿林",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "阿林"
+          ]
+        }
+      ],
+      "memories": [
+        {
+          "catalog": "soul",
+          "key": "称呼",
+          "content": "小林"
+        }
+      ],
+      "expected_key": "称呼"
+    },
+    {
+      "id": "capture-026",
+      "text": "我在上海出差，推荐几家咖啡馆？",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "上海"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-027",
+      "text": "记住我喜欢少糖",
+      "expected": [
+        {
+          "catalog": "soul",
+          "contains": [
+            "少糖"
+          ]
+        }
+      ],
+      "pipeline_capture": false
+    },
+    {
+      "id": "capture-028",
+      "text": "我这周在上海工作",
+      "expected": [
+        {
+          "catalog": "daily",
+          "contains": [
+            "上海"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture-029",
+      "text": "你好",
+      "expected": []
+    },
+    {
+      "id": "capture-030",
+      "text": "谢谢",
+      "expected": []
+    },
+    {
+      "id": "capture-031",
+      "text": "好的",
+      "expected": []
+    },
+    {
+      "id": "capture-032",
+      "text": "继续",
+      "expected": []
+    },
+    {
+      "id": "capture-033",
+      "text": "今天上海天气如何？",
+      "expected": []
+    },
+    {
+      "id": "capture-034",
+      "text": "帮我记一个待办：买茶",
+      "expected": []
+    },
+    {
+      "id": "capture-035",
+      "text": "提醒我明天九点开会",
+      "expected": []
+    },
+    {
+      "id": "capture-036",
+      "text": "请制定五步学习计划",
+      "expected": []
+    },
+    {
+      "id": "capture-037",
+      "text": "我喜欢什么口味？",
+      "expected": []
+    },
+    {
+      "id": "capture-038",
+      "text": "我在哪里？",
+      "expected": []
+    },
+    {
+      "id": "capture-039",
+      "text": "我叫什么？",
+      "expected": []
+    },
+    {
+      "id": "capture-040",
+      "text": "还记得我的名字吗？",
+      "expected": []
+    },
+    {
+      "id": "capture-041",
+      "text": "翻译：我讨厌香菜",
+      "expected": []
+    },
+    {
+      "id": "capture-042",
+      "text": "假设我喜欢吃辣，你如何回答？",
+      "expected": []
+    },
+    {
+      "id": "capture-043",
+      "text": "她说我最近在杭州，这是一句转述",
+      "expected": []
+    },
+    {
+      "id": "capture-044",
+      "text": "小说角色说：我讨厌香菜",
+      "expected": []
+    },
+    {
+      "id": "capture-045",
+      "text": "我用密码管理器，有什么推荐？",
+      "expected": []
+    },
+    {
+      "id": "capture-046",
+      "text": "我忘记密码了怎么办？",
+      "expected": []
+    },
+    {
+      "id": "capture-047",
+      "text": "今天写了120行代码",
+      "expected": []
+    },
+    {
+      "id": "capture-048",
+      "text": "删除昨天的笔记",
+      "expected": []
+    },
+    {
+      "id": "capture-049",
+      "text": "/today",
+      "expected": []
+    },
+    {
+      "id": "capture-050",
+      "text": "我想明天开始学编程，你帮我制定计划",
+      "expected": []
+    },
+    {
+      "id": "capture-051",
+      "text": "我的待办里有多少任务？",
+      "expected": []
+    },
+    {
+      "id": "capture-052",
+      "text": "我的密码是 synthetic-evaluation-only",
+      "expected": [],
+      "sensitive": true
+    },
+    {
+      "id": "capture-053",
+      "text": "验证码：123456",
+      "expected": [],
+      "sensitive": true
+    },
+    {
+      "id": "capture-054",
+      "text": "身份证号：110101199001010018",
+      "expected": [],
+      "sensitive": true
+    },
+    {
+      "id": "capture-055",
+      "text": "银行卡号：4111111111111111",
+      "expected": [],
+      "sensitive": true
+    },
+    {
+      "id": "capture-056",
+      "text": "记住我的护照号：P00000001",
+      "expected": [],
+      "sensitive": true
+    }
+  ]
+}

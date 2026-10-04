@@ -33,7 +33,7 @@ class Model:
         if info['usage_today']['calls']>=info['model_call_limit']:
             raise ModelError('今日模型调用达到预算上限，仍可使用 /today、/todos 等事务命令')
 
-    def _request(self, body):
+    def _request(self, body, purpose='chat'):
         self._budget()
         payload = json.dumps(sanitize(body), ensure_ascii=False).encode()
         request = urllib.request.Request(self.base + '/chat/completions', data=payload,
@@ -55,7 +55,7 @@ class Model:
                 usage=data.get('usage') or {}
                 with self.store.transaction() as db:
                     from .contracts import identifier,stamp
-                    db.execute('INSERT INTO usage VALUES (?,?,?,?,?)',(identifier(),self.name,max(0,int(usage.get('prompt_tokens',0))),max(0,int(usage.get('completion_tokens',0))),stamp()))
+                    db.execute('INSERT INTO usage (id,model,input_tokens,output_tokens,created_at,purpose) VALUES (?,?,?,?,?,?)',(identifier(),self.name,max(0,int(usage.get('prompt_tokens',0))),max(0,int(usage.get('completion_tokens',0))),stamp(),purpose))
             return message
         except urllib.error.HTTPError as exc:
             raise ModelError(f'模型接口返回 HTTP {exc.code}，请检查密钥、余额和模型配置') from None
@@ -74,12 +74,15 @@ class Model:
         if not self.key:
             return ''
         from .capture import PROMPT
+        from .privacy import blocked_memory, reasons
+        if reasons(text):return ''
+        memories=[item for item in memories if not blocked_memory(item)]
         known = json.dumps([{'catalog': item.get('catalog'), 'key': item.get('key'),
                              'content': (item.get('content') or '')[:120]} for item in memories[:30]], ensure_ascii=False)
         message = self._request({'model': self.name, 'messages': [
-            {'role': 'system', 'content': PROMPT},
+            {'role': 'system', 'content': PROMPT+'\n当前时间：'+datetime.now(self.zone).isoformat()+'；用户时区：'+self.zone.key},
             {'role': 'user', 'content': '已有记忆：' + known + '\n用户这句话：' + text[:8000]}],
-            'max_tokens': 500})
+            'max_tokens': 700,'temperature':0,'response_format':{'type':'json_object'}},purpose='capture')
         content = message.get('content')
         return content if isinstance(content, str) else ''
 

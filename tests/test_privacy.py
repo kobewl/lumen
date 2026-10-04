@@ -29,6 +29,10 @@ class PrivacyTest(unittest.TestCase):
                      '我的密\u200b码：'+PASSWORD,'身份证号：１１０１０１１９９００１０１００１８',
                      '护照号：P00000001','https://' + 'user' + ':' + 'synthetic' + '@example.invalid'):
             with self.subTest(text_kind=text[:4]):self.assertTrue(reasons(text))
+    def test_json_and_english_assignment_are_not_forwarded(self):
+        for text in (json.dumps({'password':PASSWORD}), 'my password is '+PASSWORD, json.dumps({'护照号':'P00000001'})):
+            self.assertTrue(reasons(text))
+            self.assertNotIn(PASSWORD,redact(text))
     def test_ordinary_facts_and_security_discussion_are_not_secrets(self):
         for text in ('我讨厌香菜','我用密码管理器','我忘记密码了','银行卡丢了怎么办','我在上海出差','今天写了120行代码'):
             self.assertEqual(reasons(text),())

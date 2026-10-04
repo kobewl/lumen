@@ -9,9 +9,9 @@ _CREDENTIAL_LABEL = r'(?:密码|口令|验证码|密钥|私钥|访问令牌|安�
 _ID_LABEL = r'(?:身份证(?:号(?:码)?)?|证件号(?:码)?|护照(?:号(?:码)?)?|passport(?: number)?|identity number)'
 _CARD_LABEL = r'(?:银行卡(?:号)?|信用卡(?:号)?|储蓄卡(?:号)?|卡号|card number|cvv|cvc)'
 _LABELS = [('凭据', _CREDENTIAL_LABEL), ('证件', _ID_LABEL), ('银行卡', _CARD_LABEL)]
-_ASSIGNED = re.compile(_CREDENTIAL_LABEL + r'\s*(?:是|为|改成|[:=：])\s*[\w!@#$%^&*.+/=-]+', re.I)
-_DOCUMENT = re.compile(_ID_LABEL + r'\s*(?:是|为|[:=：])?\s*[a-z\d][a-z\d -]{4,}', re.I)
-_CARD = re.compile(_CARD_LABEL + r'\s*(?:是|为|[:=：])?\s*\d[\d -]{2,}', re.I)
+_ASSIGNED = re.compile(_CREDENTIAL_LABEL + r'''["'”’]?\s*(?:是|为|改成|is\b|[:=：])\s*["'“‘]?[\w!@#$%^&*.+/=-]+''', re.I)
+_DOCUMENT = re.compile(_ID_LABEL + r'''["'”’]?\s*(?:是|为|is\b|[:=：])?\s*["'“‘]?[a-z\d][a-z\d -]{4,}''', re.I)
+_CARD = re.compile(_CARD_LABEL + r'''["'”’]?\s*(?:是|为|is\b|[:=：])?\s*["'“‘]?\d[\d -]{2,}''', re.I)
 _NUMBER = re.compile(r'(?<!\d)\d(?:[ -]?\d){11,21}[xX]?(?!\d)')
 _TOKEN = re.compile(r'\b(?:sk-[\w-]{16,}|gh[pousr]_[\w]{20,}|github_pat_[\w]{30,}|xox[baprs]-[\w-]{20,}|AKIA[A-Z0-9]{16})\b')
 _JWT = re.compile(r'\beyJ[\w-]+\.[\w-]+\.[\w-]{12,}\b')
@@ -40,6 +40,11 @@ def reasons(text):
     if not isinstance(text, str):
         return ()
     text = normalize(text)
+    if text.lstrip().startswith(('{','[')):
+        try:
+            text=json.dumps(json.loads(text),ensure_ascii=False)
+        except ValueError:
+            pass
     found = set()
     if _ASSIGNED.search(text) or _TOKEN.search(text) or _JWT.search(text) or _PRIVATE.search(text) or _URL_PASSWORD.search(text):
         found.add('凭据')

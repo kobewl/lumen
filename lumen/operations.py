@@ -8,7 +8,7 @@ from .contracts import now, stamp
 from .domain import Changes, require
 
 RECOVERABLE = {'memories','todos','notes','projects','schedules','plans','memory_policies'}
-EXPORT_TABLES = (*sorted(RECOVERABLE),'messages','changes','runs','deliveries','feishu_inbox','settings','usage','chat_requests')
+EXPORT_TABLES = (*sorted(RECOVERABLE),'messages','changes','runs','deliveries','feishu_inbox','settings','usage','chat_requests','capture_events')
 LABELS = {'expire_memory':'临时记忆到期','save_memory':'记住或更正信息','delete_memory':'忘记信息','confirm_memory':'确认记忆',
           'set_memory_policy':'调整记忆权限','accept_revision':'采纳记忆修改','dismiss_revision':'忽略记忆修改',
           'add_todo':'添加任务','update_todo':'修改任务','delete_todo':'删除任务','save_note':'保存笔记','delete_note':'删除笔记',

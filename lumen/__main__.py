@@ -147,7 +147,7 @@ def main():
         finally:process_lock.close()
         print('数据库已恢复；请启动服务验证。')
         return
-    for name,default,minimum,maximum in [('LUMEN_MODEL_DAILY_CALL_LIMIT','120',0,100000),('LUMEN_MODEL_TIMEOUT_SECONDS','45',1,120)]:
+    for name,default,minimum,maximum in [('LUMEN_MODEL_DAILY_CALL_LIMIT','120',0,100000),('LUMEN_MODEL_TIMEOUT_SECONDS','45',1,120),('LUMEN_CAPTURE_DAILY_CALL_LIMIT','24',0,100000),('LUMEN_CAPTURE_CHAT_RESERVE','20',1,100000),('LUMEN_CAPTURE_MAX_CHARS','1500',1,8000)]:
         try:
             value=int(os.getenv(name,default))
             if not minimum<=value<=maximum:raise ValueError()

@@ -45,6 +45,9 @@ def migrate(db):
             CREATE TABLE IF NOT EXISTS memory_policies (
                 id TEXT PRIMARY KEY, catalog TEXT NOT NULL, operation TEXT NOT NULL,
                 mode TEXT NOT NULL, UNIQUE(catalog, operation));
+            CREATE TABLE IF NOT EXISTS capture_events (
+                id TEXT PRIMARY KEY, reason TEXT NOT NULL,
+                attempted INTEGER NOT NULL, created_at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS schedules_due ON schedules(enabled,status,run_at);
             CREATE INDEX IF NOT EXISTS todos_due ON todos(done,due_at);
             CREATE INDEX IF NOT EXISTS deliveries_pending ON deliveries(status,next_at);
@@ -52,3 +55,5 @@ def migrate(db):
         ''')
         from .policy import ensure
         ensure(db)
+        if 'purpose' not in {row[1] for row in db.execute('PRAGMA table_info(usage)')}:
+            db.execute("ALTER TABLE usage ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'")

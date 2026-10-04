@@ -62,7 +62,7 @@ class OperationsTest(unittest.TestCase):
         self.assertEqual(len(model.inputs),2);self.assertEqual(len(self.store.state()['todos']),1)
         with self.assertRaises(ModelError):agent.reply('different',request_id='request-1')
     def test_budget_stops_model_before_network_request(self):
-        with self.store.transaction() as db:db.execute('INSERT INTO usage VALUES (?,?,?,?,?)',('u','test',10,20,stamp()))
+        with self.store.transaction() as db:db.execute('INSERT INTO usage (id,model,input_tokens,output_tokens,created_at) VALUES (?,?,?,?,?)',('u','test',10,20,stamp()))
         with patch.dict('os.environ',{'LUMEN_MODEL_API_KEY':'test','LUMEN_MODEL_DAILY_CALL_LIMIT':'1'}):
             model=Model();model.store=self.store
             with self.assertRaisesRegex(ModelError,'预算'):model.complete([{'role':'user','content':'hello'}])
