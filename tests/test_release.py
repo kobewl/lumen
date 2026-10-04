@@ -39,7 +39,7 @@ class ReleaseTest(unittest.TestCase):
                     request=urllib.request.Request(base+'/api/'+path,headers={'Authorization':'Bearer test-token'})
                     with urllib.request.urlopen(request) as response:
                         data=response.read()
-                        if path=='status':self.assertEqual(json.loads(data)['version'],'1.0.0')
+                        if path=='status':self.assertEqual(json.loads(data)['version'],'1.1.0')
                         if path=='export':self.assertEqual(json.loads(data)['tables']['notes'][0]['title'],'private')
                         if path=='backup':self.assertTrue(data.startswith(b'SQLite format 3\x00'))
             finally:server.shutdown();server.server_close();t.join();store.db.close()

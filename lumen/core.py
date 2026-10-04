@@ -97,6 +97,7 @@ class Store:
 
     def state(self):
         from .privacy import blocked_memory
+        from .permissions import pending
         cutoff = self.query("SELECT value FROM settings WHERE key='chat_view_cutoff'")
         visible_after = int(cutoff[0]['value']) if cutoff else 0
         return {
@@ -110,6 +111,8 @@ class Store:
             'projects': self.query('SELECT * FROM projects ORDER BY created_at DESC'),
             'plans': self.query('SELECT * FROM plans ORDER BY created_at DESC'),
             'policies': self.query('SELECT id,catalog,operation,mode FROM memory_policies ORDER BY catalog,operation'),
+            'action_policies':self.query('SELECT scope,operation,mode FROM action_policies ORDER BY scope'),
+            'pending_actions':pending(self),
         }
 
 

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import io
 import os
 import subprocess
 import tempfile
@@ -94,3 +95,17 @@ class CaptureBudgetTest(unittest.TestCase):
         actual=[{'catalog':'soul','key':'口味','content':'不吃香菜'},{'catalog':'daily','key':'地点','content':'上海'}]
         self.assertEqual(module.score(expected,actual),{'tp':1,'fp':1,'fn':0})
         self.assertEqual(module.score(expected,actual,'其他名称'),{'tp':0,'fp':2,'fn':1})
+    def test_evaluation_quality_gate_fails_bad_or_incomplete_batches(self):
+        spec=importlib.util.spec_from_file_location('evaluation','scripts/evaluate_capture.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        fixture=Path(self.tmp.name)/'samples.json';output=Path(self.tmp.name)/'report.json'
+        fixture.write_text(json.dumps({'samples':[{'id':'positive','text':'I hate cilantro','expected':[{'catalog':'soul','contains':['cilantro']}]},{'id':'negative','text':'hello','expected':[]}]}))
+        class FixtureModel:
+            key='test-only';name='unit-test-stub';calls=0
+            def classify(self,*args):self.calls+=1;return '{"items":[{"catalog":"soul","key":"food","content":"hate cilantro"}]}'
+        with patch.object(module,'Model',FixtureModel),patch('sys.stdout',new_callable=io.StringIO):
+            self.assertEqual(module.main(['--live','--samples',str(fixture),'--output',str(output)]),1)
+        report=json.loads(output.read_text());self.assertTrue(report['quality_gate']['complete']);self.assertFalse(report['quality_gate']['passed'])
+        self.assertEqual(report['classification']['precision'],0.5)
+        with patch.object(module,'Model',FixtureModel),patch('sys.stdout',new_callable=io.StringIO):
+            self.assertEqual(module.main(['--live','--samples',str(fixture),'--output',str(output),'--max-calls','1']),1)
+        report=json.loads(output.read_text());self.assertFalse(report['quality_gate']['complete']);self.assertEqual(report['api_attempts'],1)

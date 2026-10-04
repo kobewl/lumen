@@ -31,9 +31,12 @@ def main(argv=None):
     parser.add_argument('--samples',type=Path,default=Path(__file__).resolve().parents[1]/'evaluations/capture_samples.json')
     parser.add_argument('--live',action='store_true',help='明确调用配置的真实模型，产生 API 费用')
     parser.add_argument('--max-calls',type=int,default=60,help='本次评测最多真实调用数量')
+    parser.add_argument('--min-precision',type=float,default=0.9,help='真实评测 precision 的最低门槛')
+    parser.add_argument('--min-recall',type=float,default=0.9,help='真实评测 recall 的最低门槛')
     parser.add_argument('--output',type=Path,help='报告路径；报告不保存原始输出或密钥')
     args=parser.parse_args(argv)
     if not 1<=args.max_calls<=1000:parser.error('--max-calls 必须为 1–1000')
+    if not 0<=args.min_precision<=1 or not 0<=args.min_recall<=1:parser.error('质量门槛必须为 0–1')
     raw=args.samples.read_bytes();dataset=json.loads(raw)
     samples=dataset['samples'];model=Model()
     if args.live and not model.key:
@@ -77,12 +80,17 @@ def main(argv=None):
     if args.live:
         report['classification']={**counts,'precision':counts['tp']/(counts['tp']+counts['fp']) if counts['tp']+counts['fp'] else None,
                                   'recall':counts['tp']/(counts['tp']+counts['fn']) if counts['tp']+counts['fn'] else None}
+        complete=all(row['result'] in ('ok','sensitive_input_blocked') for row in outcomes)
+        metrics=report['classification']
+        report['quality_gate']={'complete':complete,'min_precision':args.min_precision,'min_recall':args.min_recall,
+                               'passed':complete and metrics['precision'] is not None and metrics['recall'] is not None
+                                        and metrics['precision']>=args.min_precision and metrics['recall']>=args.min_recall}
     if args.output:
         args.output.parent.mkdir(parents=True,exist_ok=True)
         fd=os.open(args.output,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
         with os.fdopen(fd,'w') as target:json.dump(report,target,ensure_ascii=False,indent=2)
         os.chmod(args.output,0o600)
     print(json.dumps({key:value for key,value in report.items() if key!='outcomes'},ensure_ascii=False,indent=2))
-    return 1 if args.live and any(row['result'] in ('request_or_parse_error','invalid_items','sensitive_output','call_limit') for row in outcomes) else 0
+    return 1 if args.live and not report['quality_gate']['passed'] else 0
 
 if __name__=='__main__':raise SystemExit(main())

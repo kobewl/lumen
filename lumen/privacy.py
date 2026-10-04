@@ -12,7 +12,7 @@ _LABELS = [('凭据', _CREDENTIAL_LABEL), ('证件', _ID_LABEL), ('银行卡', _
 _ASSIGNED = re.compile(_CREDENTIAL_LABEL + r'''["'”’]?\s*(?:是|为|改成|is\b|[:=：])\s*["'“‘]?[\w!@#$%^&*.+/=-]+''', re.I)
 _DOCUMENT = re.compile(_ID_LABEL + r'''["'”’]?\s*(?:是|为|is\b|[:=：])?\s*["'“‘]?[a-z\d][a-z\d -]{4,}''', re.I)
 _CARD = re.compile(_CARD_LABEL + r'''["'”’]?\s*(?:是|为|is\b|[:=：])?\s*["'“‘]?\d[\d -]{2,}''', re.I)
-_NUMBER = re.compile(r'(?<!\d)\d(?:[ -]?\d){11,21}[xX]?(?!\d)')
+_NUMBER = re.compile(r'(?<![\da-fA-F])\d(?:[ -]?\d){11,21}[xX]?(?![\da-fA-F])')
 _TOKEN = re.compile(r'\b(?:sk-[\w-]{16,}|gh[pousr]_[\w]{20,}|github_pat_[\w]{30,}|xox[baprs]-[\w-]{20,}|AKIA[A-Z0-9]{16})\b')
 _JWT = re.compile(r'\beyJ[\w-]+\.[\w-]+\.[\w-]{12,}\b')
 _PRIVATE = re.compile(r'-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----')
@@ -40,9 +40,10 @@ def reasons(text):
     if not isinstance(text, str):
         return ()
     text = normalize(text)
-    if text.lstrip().startswith(('{','[')):
+    if text.lstrip().startswith(('{','[','"')):
         try:
-            text=json.dumps(json.loads(text),ensure_ascii=False)
+            decoded=json.loads(text)
+            text=normalize(decoded) if isinstance(decoded,str) else json.dumps(decoded,ensure_ascii=False)
         except ValueError:
             pass
     found = set()
@@ -65,7 +66,7 @@ def memory_reasons(key, content):
     found = set(reasons(key + '\n' + content))
     normalized = normalize(key)
     for kind, label in _LABELS:
-        if re.fullmatch(r'(?:我的|账户|账号|登录|支付|邮箱|服务器|网站)?\s*' + label, normalized, re.I):
+        if re.search(label+r'\s*$', normalized, re.I):
             found.add(kind)
     return tuple(sorted(found))
 
@@ -96,12 +97,27 @@ def redact(text):
 def sanitize(value):
     """Apply to every outbound message, including tool results and old history."""
     if isinstance(value, str):
+        if value.lstrip().startswith(('{','[')):
+            try:
+                structured=json.loads(value)
+                if isinstance(structured,(dict,list)):
+                    return json.dumps(sanitize(structured),ensure_ascii=False)
+            except (ValueError,RecursionError):
+                pass
         return redact(value)
     if isinstance(value, list):
         return [sanitize(item) for item in value]
     if isinstance(value, dict):
         result = {}
+        label=value.get('key') or value.get('title')
+        protected=isinstance(label,str) and isinstance(value.get('content'),str) and bool(memory_reasons(label,value['content']))
         for key, item in value.items():
+            if isinstance(key,str) and isinstance(item,(str,int,float)) and memory_reasons(key,str(item)):
+                result[key]=MARKER
+                continue
+            if protected and key in ('content','proposed_content'):
+                result[key]=MARKER
+                continue
             if key == 'arguments' and isinstance(item, str):
                 try:
                     item = json.dumps(sanitize(json.loads(item)), ensure_ascii=False)

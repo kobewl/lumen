@@ -110,6 +110,16 @@ class Agent:
         parts = text.split(maxsplit=1)
         command, argument = parts[0], parts[1] if len(parts)>1 else ''
         state = self.store.state()
+        if command=='/pending':
+            rows=state['pending_actions']
+            return '\n\n'.join(row['id'][:8]+' · '+row['label']+' · '+row['title']+'\n'+row['detail'] for row in rows) or '暂无待确认操作。'
+        if command in ('/confirm','/cancel'):
+            rows=[row for row in state['pending_actions'] if len(argument)>=8 and row['id'].startswith(argument)]
+            if len(rows)!=1:return '请提供唯一待确认操作 ID（至少前 8 位）；先用 /pending 查看。'
+            try:
+                self.actions.execute('approve_action' if command=='/confirm' else 'reject_action',{'id':rows[0]['id']})
+                return '已确认并执行删除。' if command=='/confirm' else '已取消，原记录保留。'
+            except ValueError as exc:return str(exc)
         if command=='/undo':
             try:
                 rows=self.actions.execute('get_activity',{})['activity']
@@ -142,7 +152,7 @@ class Agent:
             self.actions.execute('accept_revision',{'id':rows[0]['id']})
             return '已采纳对「'+rows[0]['key']+'」的修改。'
         if command=='/help':
-            return '/status 运行状态\n/undo 撤销最近操作\n/today 今日简报\n/review 七天回顾\n/reminders 查看提醒\n/snooze ID 分钟 稍后提醒\n/new 新对话\n/todos 待办\n/memory 个人记忆\n/notes 笔记\n/projects 项目\n/plans 计划草稿\n/approve ID 确认计划\n/reject ID 取消计划\n/remember ID 确认候选记忆\n/accept ID 采纳对已有记忆的修改'
+            return '/pending 待确认删除\n/confirm ID 确认删除\n/cancel ID 取消删除\n/status 运行状态\n/undo 撤销最近操作\n/today 今日简报\n/review 七天回顾\n/reminders 查看提醒\n/snooze ID 分钟 稍后提醒\n/new 新对话\n/todos 待办\n/memory 个人记忆\n/notes 笔记\n/projects 项目\n/plans 计划草稿\n/approve ID 确认计划\n/reject ID 取消计划\n/remember ID 确认候选记忆\n/accept ID 采纳对已有记忆的修改'
         lists = {'/todos':('todos','title'),'/memory':('memories','key'),'/notes':('notes','title'),'/projects':('projects','title'),'/plans':('plans','title'),'/reminders':('schedules','title')}
         if command in lists:
             table, title = lists[command]
@@ -181,9 +191,10 @@ class Agent:
 只把 memories 里已确认且未过期的内容当作个人事实。pending_memories 和 pending_revisions 还没生效。
 个人状态是有限摘要，记录数量多时用 search_records 搜索，再用 get_record 读取真实记录；回答笔记内容时给出实际标题，不编造出处。
 必须通过工具完成写入，只有工具返回 ok=true 才能说已完成。用真实 ID，不能编造。
+删除工具受权限表控制。effect=pending 仅创建了待确认请求，原记录仍在；必须明确说「尚未删除」，提供 request_id 和 /confirm ID 或面板确认方式。不能自行确认，不能通过修改记录来绕过删除权限。
 密码、验证码、密钥、证件号、银行卡号不能保存为记忆。看到「[敏感信息已拦截]」时解释本地已拦截，不猜测或追问被隐藏的值。
 记忆目录：soul 是个人 Soul（称呼、价值观、稳定偏好、长期喜恶），daily 是日常（行程、近况、临时状态）。
-回答前，独立捕获器已经按权限表处理过这句话。effect=stored 的条目已经生效，不要再用 save_memory 写同一事实。effect=pending 需要用户 /remember。effect=proposed 是对已有事实的修改建议，原事实仍然有效，请告诉用户发送 /accept ID。
+符合本地预筛与预算时，独立捕获器会按权限表处理这句话；以本轮实际回执为准。effect=stored 的条目已经生效，不要再用 save_memory 写同一事实。effect=pending 需要用户 /remember。effect=proposed 是对已有事实的修改建议，原事实仍然有效，请告诉用户发送 /accept ID。
 记忆规则：
 - 用户明确说记住或更正时，调用 save_memory，并带上 catalog。同一事实使用原 id 更新，不另建同义 key。
 - 不要把待办、计划、猜测写成记忆。捕获器已经覆盖的随口事实不要再保存一次。
@@ -204,7 +215,7 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
                 + json.dumps(filed, ensure_ascii=False)})
         if completed:
             messages.append({'role': 'system', 'content':
-                '以下写操作已经由运行时执行成功。不要重复执行；根据最新数据回答，必要时继续其他操作：'
+                '以下工具返回已经记录。effect=pending 是待确认请求，删除尚未执行；其他结果按 effect 判断。不要重复调用，根据最新数据回答：'
                 + json.dumps(completed, ensure_ascii=False)})
         return messages
 
@@ -292,7 +303,7 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
                                         write_results[signature] = result
                                     completed.append(result)
                                     changed = True
-                                    if function['name'] == 'delete_memory':
+                                    if function['name'] == 'delete_memory' and result.get('effect')!='pending':
                                         history = []
                                         forgot = True
                         except (ValueError, KeyError, TypeError) as exc:
@@ -316,7 +327,8 @@ Todo 截止时间不等于提醒；用户要求提醒时创建 reminder。需要
                 if filed:
                     detail += '\n捕获器已处理：' + json.dumps(filed, ensure_ascii=False)
                 if completed:
-                    detail += '\n已成功执行的操作：' + json.dumps(completed, ensure_ascii=False)
+                    label = '工具结果（effect=pending 的删除尚未执行）：' if any(item.get('effect')=='pending' and item.get('action','').startswith('delete_') for item in completed) else '已成功执行的操作：'
+                    detail += '\n' + label + json.dumps(completed, ensure_ascii=False)
                 if not scheduled:
                     self.store.message('assistant', detail, source='error')
                 raise ModelError(detail) from None

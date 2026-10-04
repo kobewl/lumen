@@ -48,6 +48,7 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(self.store.state()['memories'][0]['content'], '中文')
 
     def test_forgetting_removes_old_fact_from_current_and_future_model_context(self):
+        self.actions.execute('set_action_policy',{'scope':'memory','mode':'auto'})
         self.store.message('user', '请记住我的代号是 old-private-fact')
         self.store.message('assistant', '记住了 old-private-fact')
         memory = self.actions.execute('save_memory', {'key': '代号', 'content': 'old-private-fact'})

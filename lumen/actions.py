@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from .core import CATALOG, USER_ACTIONS, identifier, now, stamp
 from .domain import Changes, TABLES, execute, require, search
 from .privacy import blocked_memory, require_safe_memory
+from .permissions import DELETE_ACTIONS,delete,request_delete,approve,reject,set_policy,pending as pending_actions
 
 
 class Actions:
@@ -56,10 +57,13 @@ class Actions:
         pending = [{'id':row['id'],'catalog':row['catalog'],'key':row['key']} for row in self.store.query("SELECT * FROM memories WHERE status='pending' ORDER BY updated_at DESC LIMIT 8") if not blocked_memory(row)]
         policies = self.store.query('SELECT catalog,operation,mode FROM memory_policies ORDER BY catalog,operation')
         return {'plans':plans,'memories':memories,'pending_memories':pending,'pending_revisions':revisions,
+                'pending_actions':pending_actions(self.store)[:8],
                 'memory_policy':policies,'todos':todos,'schedules':schedules,'notes':notes,'projects':projects,
                 'counts':counts,'hint':'memories 才是已生效事实，按 catalog 分为 soul 与 daily。pending_memories 和 pending_revisions 还没有生效。'}
 
     def execute(self, name, args, scheduled=False, actor='user'):
+        if actor not in ('user','agent','capture') or (actor=='capture' and name!='save_memory'):
+            raise ValueError('此调用者没有操作权限')
         if not isinstance(name,str) or name not in CATALOG or not isinstance(args,dict):
             raise ValueError('未知工具或无效参数')
         schema = CATALOG[name]
@@ -77,10 +81,16 @@ class Actions:
                 valid = isinstance(value,str) and len(value.strip())>=prop.get('minLength',1) and len(value)<=prop.get('maxLength',4000)
             if not valid or ('enum' in prop and value not in prop['enum']):
                 raise ValueError(f'{key} 取值无效')
-        if actor=='agent' and name in {t['function']['name'] for t in USER_ACTIONS}:
+        if actor!='user' and name in {t['function']['name'] for t in USER_ACTIONS}:
             raise ValueError('此操作需要用户明确确认，请使用管理面板或快捷命令')
         if scheduled and name in ('create_schedule','update_schedule','delete_schedule','save_memory','delete_memory','confirm_memory','apply_plan','reject_plan','propose_plan','snooze_schedule'):
             raise ValueError('定时执行不能修改记忆或管理其他定时任务')
+        if name=='get_pending_actions':return {'requests':pending_actions(self.store)}
+        if name=='approve_action':return approve(self,args)
+        if name=='reject_action':return reject(self,args)
+        if name=='set_action_policy':return set_policy(self,args)
+        if name in DELETE_ACTIONS and actor=='agent':
+            return request_delete(self,name,args)
         if name=='set_memory_policy':
             with self.store.transaction() as db:
                 row = db.execute('SELECT * FROM memory_policies WHERE catalog=? AND operation=?', (args['catalog'], args['operation'])).fetchone()
@@ -123,10 +133,9 @@ class Actions:
             changes = Changes(db)
             if name=='save_memory':
                 record_id, extra = self._save_memory(db, changes, args, record_id, actor)
-            elif name=='delete_memory':
-                require(db,'memories',record_id)
-                changes.delete('memories',record_id)
-                self.store.reset_context(db)
+            elif name in DELETE_ACTIONS:
+                delete(self,db,changes,name,record_id)
+                extra={'effect':'deleted'}
             elif name in ('add_todo','update_todo'):
                 row = require(db,'todos',record_id) if name=='update_todo' else {}
                 if name=='update_todo' and len(args)==1:
@@ -151,13 +160,6 @@ class Actions:
                     changes.put('schedules',item_id,{'title':'待办提醒：'+args.get('title',row.get('title','')),
                         'prompt':args.get('title',row.get('title','')),'kind':'reminder','repeat':'none','run_at':self.date(args['remind_at'],future=True),
                         'created_at':stamp(),'todo_id':record_id})
-            elif name=='delete_todo':
-                require(db,'todos',record_id)
-                for item in db.execute('SELECT id,status FROM schedules WHERE todo_id=?',(record_id,)).fetchall():
-                    if item['status']=='running':
-                        raise ValueError('关联提醒正在执行，请稍后删除任务')
-                    changes.put('schedules',item['id'],{'enabled':0,'todo_id':None})
-                changes.delete('todos',record_id)
             elif name=='create_schedule':
                 run_at=self.date(args['run_at'],future=True)
                 local=datetime.fromisoformat(run_at).astimezone(self.zone)
@@ -168,13 +170,11 @@ class Actions:
                     raise ValueError('简报任务 prompt 必须为 today 或 weekly')
                 changes.put('schedules',record_id,{'title':args['title'],'prompt':args['prompt'],'kind':args['kind'],
                     'run_at':run_at,'repeat':args['repeat'],'created_at':stamp(),'month_day':local.day,'wall_time':local.strftime('%H:%M:%S'),'zone_name':self.zone.key})
-            elif name in ('delete_schedule','update_schedule','snooze_schedule'):
+            elif name in ('update_schedule','snooze_schedule'):
                 row = require(db,'schedules',record_id)
                 if row['status']=='running':
                     raise ValueError('任务正在执行，请完成后再修改')
-                if name=='delete_schedule':
-                    changes.delete('schedules',record_id)
-                elif name=='snooze_schedule':
+                if name=='snooze_schedule':
                     changes.put('schedules',record_id,{'run_at':stamp(now()+timedelta(minutes=args['minutes'])),'enabled':1,'status':'pending','last_error':None})
                 else:
                     if len(args)==1:

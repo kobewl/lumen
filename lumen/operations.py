@@ -7,9 +7,10 @@ from pathlib import Path
 from .contracts import now, stamp
 from .domain import Changes, require
 
-RECOVERABLE = {'memories','todos','notes','projects','schedules','plans','memory_policies'}
+RECOVERABLE = {'memories','todos','notes','projects','schedules','plans','memory_policies','action_policies','action_requests'}
 EXPORT_TABLES = (*sorted(RECOVERABLE),'messages','changes','runs','deliveries','feishu_inbox','settings','usage','chat_requests','capture_events')
 LABELS = {'expire_memory':'临时记忆到期','save_memory':'记住或更正信息','delete_memory':'忘记信息','confirm_memory':'确认记忆',
+          'request_delete':'提出删除请求','approve_action':'确认删除','reject_action':'取消删除请求','set_action_policy':'调整删除权限',
           'set_memory_policy':'调整记忆权限','accept_revision':'采纳记忆修改','dismiss_revision':'忽略记忆修改',
           'add_todo':'添加任务','update_todo':'修改任务','delete_todo':'删除任务','save_note':'保存笔记','delete_note':'删除笔记',
           'save_project':'保存项目','delete_project':'删除项目','propose_plan':'拟定计划','apply_plan':'确认计划','reject_plan':'取消计划',

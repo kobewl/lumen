@@ -6,7 +6,7 @@ from unittest.mock import patch
 from lumen.agent import Agent,Model
 from lumen.core import Store,Actions,stamp
 from lumen.capture import file_utterance
-from lumen.privacy import reasons,require_safe_memory,redact
+from lumen.privacy import reasons,require_safe_memory,redact,sanitize
 from test_lumen import ScriptModel,call
 
 PASSWORD='synthetic-password-only'
@@ -30,13 +30,20 @@ class PrivacyTest(unittest.TestCase):
                      '护照号：P00000001','https://' + 'user' + ':' + 'synthetic' + '@example.invalid'):
             with self.subTest(text_kind=text[:4]):self.assertTrue(reasons(text))
     def test_json_and_english_assignment_are_not_forwarded(self):
-        for text in (json.dumps({'password':PASSWORD}), 'my password is '+PASSWORD, json.dumps({'护照号':'P00000001'})):
+        for text in (json.dumps({'password':PASSWORD}),json.dumps('密码是 '+PASSWORD), 'my password is '+PASSWORD, json.dumps({'护照号':'P00000001'})):
             self.assertTrue(reasons(text))
             self.assertNotIn(PASSWORD,redact(text))
+        self.assertNotIn(PASSWORD,sanitize(json.dumps({'password':PASSWORD})))
+        self.assertNotIn(PASSWORD,str(sanitize({'password':PASSWORD})))
+    def test_service_specific_secret_keys_cannot_hide_unlabeled_values(self):
+        for key in ('家庭共享 WiFi 密码','第三方客户端 api_key','银行账户的登录密码','测试环境访问令牌'):
+            with self.assertRaises(ValueError):require_safe_memory(key,PASSWORD)
+        require_safe_memory('密码管理器','使用本地管理器')
     def test_ordinary_facts_and_security_discussion_are_not_secrets(self):
         for text in ('我讨厌香菜','我用密码管理器','我忘记密码了','银行卡丢了怎么办','我在上海出差','今天写了120行代码'):
             self.assertEqual(reasons(text),())
             require_safe_memory('近况',text)
+        self.assertEqual(reasons('a'+CARD+'b'),())  # Do not treat digits inside a hexadecimal record ID as a card.
     def test_every_memory_actor_and_pending_status_cannot_store_sensitive_data(self):
         for actor in ('user','agent','capture'):
             for key,content in (('密码',PASSWORD),('身份信息',DOCUMENT),('支付信息',CARD)):
@@ -87,6 +94,12 @@ class PrivacyTest(unittest.TestCase):
     def test_private_key_body_and_multiline_assignments_are_fully_redacted(self):
         self.assertNotIn('synthetic-key-body',redact(PRIVATE_HEADER+'\nsynthetic-key-body\n'+PRIVATE_FOOTER))
         self.assertNotIn(PASSWORD,redact('密码\n是 '+PASSWORD))
+    def test_structured_tool_record_uses_title_to_protect_unlabeled_secret(self):
+        note=self.a.execute('save_note',{'title':'服务器密码','content':PASSWORD})
+        model=ScriptModel([call('get_record',{'type':'note','id':note['id']}),{'role':'assistant','content':'敏感内容已拦截。'}])
+        Agent(self.store,self.a,model).reply('查一下这份本地资料')
+        self.assertNotIn(PASSWORD,str(model.inputs))
+        self.assertEqual(self.store.state()['notes'][0]['content'],PASSWORD)
     def test_real_http_payload_is_sanitized_without_mutating_caller_data(self):
         class Response:
             def __enter__(self):return self

@@ -6,6 +6,7 @@ from .privacy import blocked_memory, require_safe_memory
 EMPTY = {'type': 'string', 'minLength': 0}
 TABLES = {'memory': 'memories', 'todo': 'todos', 'note': 'notes', 'project': 'projects', 'schedule': 'schedules', 'plan':'plans'}
 DOMAIN_TOOLS = [
+    tool('get_pending_actions','读取用户待确认的删除请求；这些请求尚未执行。',{}),
     tool('get_activity','读取近期操作回执，不含历史私密内容。实际撤销需要用户发送 /undo 或使用面板。',{}),
     tool('propose_plan', '为用户目标拟定计划草稿，不创建任务。用户必须在网页确认或发送 /approve ID 才会落地。id 可选，修改未确认草稿。', {'id':S,'title':S,'goal':EMPTY,'steps':{'type':'array','items':{'type':'string'},'minItems':1,'maxItems':20}}, ['title','steps']),
     tool('search_records', '关键词搜索个人记录，仅搜索已确认未过期记忆，结果包含真实 ID。',
@@ -24,6 +25,10 @@ USER_ACTIONS = [tool('undo_change','用户撤销一项事务操作，id 可选�
     tool('set_memory_policy','用户设置某个记忆目录的写入权限。auto 直接生效，confirm 需要用户确认。',
          {'catalog':{'type':'string','enum':['soul','daily']},'operation':{'type':'string','enum':['capture','revise']},'mode':{'type':'string','enum':['auto','confirm']}},
          ['catalog','operation','mode']),
+    tool('approve_action','用户确认并执行待确认删除，记录变化时拒绝执行。',{'id':S},['id']),
+    tool('reject_action','用户取消待确认删除。',{'id':S},['id']),
+    tool('set_action_policy','用户设置删除权限。auto 允许模型直接删除，confirm 先生成请求。',
+         {'scope':{'type':'string','enum':['memory','todo','note','schedule','project']},'mode':{'type':'string','enum':['auto','confirm']}},['scope','mode']),
     tool('apply_plan','用户确认计划并创建项目和任务。',{'id':S},['id']),
     tool('reject_plan','用户取消待确认计划。',{'id':S},['id'])]
 
@@ -124,18 +129,10 @@ def execute(actions, db, changes, name, args, record_id):
         if 'id' in args:
             require(db, 'notes', record_id)
         changes.put('notes', record_id, {'title': args['title'].strip(), 'content': args['content'].strip(), 'tags': args.get('tags', ''), 'updated_at': stamp()})
-    elif name == 'delete_note':
-        require(db, 'notes', record_id)
-        changes.delete('notes', record_id)
     elif name == 'save_project':
         row = require(db, 'projects', record_id) if 'id' in args else {}
         changes.put('projects', record_id, {'title': args['title'].strip(), 'goal': args.get('goal', row.get('goal', '')),
             'status': args.get('status', row.get('status', 'active')), 'created_at': row.get('created_at', stamp())})
-    elif name == 'delete_project':
-        require(db, 'projects', record_id)
-        for todo in db.execute('SELECT id FROM todos WHERE project_id=?', (record_id,)).fetchall():
-            changes.put('todos', todo['id'], {'project_id': None})
-        changes.delete('projects', record_id)
     elif name == 'confirm_memory':
         row = require(db, 'memories', record_id)
         require_safe_memory(row['key'], row['content'])

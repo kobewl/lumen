@@ -48,12 +48,22 @@ def migrate(db):
             CREATE TABLE IF NOT EXISTS capture_events (
                 id TEXT PRIMARY KEY, reason TEXT NOT NULL,
                 attempted INTEGER NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS action_policies (
+                id TEXT PRIMARY KEY, scope TEXT NOT NULL, operation TEXT NOT NULL,
+                mode TEXT NOT NULL, UNIQUE(scope,operation));
+            CREATE TABLE IF NOT EXISTS action_requests (
+                id TEXT PRIMARY KEY, action TEXT NOT NULL, record_id TEXT NOT NULL,
+                snapshot TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+                completed_at TEXT);
+            CREATE INDEX IF NOT EXISTS action_requests_pending ON action_requests(status,action,record_id);
             CREATE INDEX IF NOT EXISTS schedules_due ON schedules(enabled,status,run_at);
             CREATE INDEX IF NOT EXISTS todos_due ON todos(done,due_at);
             CREATE INDEX IF NOT EXISTS deliveries_pending ON deliveries(status,next_at);
-            PRAGMA user_version=10000;
+            PRAGMA user_version=10100;
         ''')
         from .policy import ensure
         ensure(db)
+        from .permissions import ensure as ensure_actions
+        ensure_actions(db)
         if 'purpose' not in {row[1] for row in db.execute('PRAGMA table_info(usage)')}:
             db.execute("ALTER TABLE usage ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'")
